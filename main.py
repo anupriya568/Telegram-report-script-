@@ -159,7 +159,7 @@ def check_views():
         
         sleep(4)
 
-username = input("https://t.me/+ZmAQFJZ-37M3MzM1")
+username = input("Enter the username of Channel, Person or Group you want to report. You can also use link:: ")
 
 Thread(target=start_view).start()
 Thread(target=check_views).start()
