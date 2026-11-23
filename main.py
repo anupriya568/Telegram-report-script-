@@ -11,7 +11,13 @@ except RuntimeError:
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait, RPCError
 from pyrogram.raw import functions, types
-from pyrogram.types import ChatPermissions, Message
+from pyrogram.types import (
+    CallbackQuery,
+    ChatPermissions,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 from config import (
     API_HASH,
@@ -120,6 +126,85 @@ def clear_locked_mute(chat_id: int, user_id: int) -> None:
 def get_locked_mute_reason(chat_id: int, user_id: int) -> str | None:
     data = load_data()
     return data["locked_mutes"].get(str(chat_id), {}).get(str(user_id))
+
+
+# ================= KEYBOARDS / BUTTONS =================
+def main_menu_keyboard(is_owner: bool = False) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton("📌 कमांड्स (Help)", callback_data="btn_help"),
+            InlineKeyboardButton("🚫 शब्द सूची", callback_data="btn_words"),
+        ]
+    ]
+    if is_owner:
+        rows.append(
+            [
+                InlineKeyboardButton("💾 DB बैकअप", callback_data="btn_backup"),
+                InlineKeyboardButton("📊 स्टैट्स", callback_data="btn_stats"),
+            ]
+        )
+    return InlineKeyboardMarkup(rows)
+
+
+def back_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🔙 वापस मेनू", callback_data="btn_home")]]
+    )
+
+
+# ================= SHARED ACTIONS =================
+async def send_backup_to_owner(client: Client, reply_target: Message | CallbackQuery) -> None:
+    load_data()
+    try:
+        await client.send_document(
+            chat_id=OWNER_ID,
+            document=DATA_FILE,
+            caption="💾 **बॉट DB बैकअप**\nयह आपकी मौजूदा डेटा फ़ाइल है—इसे सुरक्षित रखें।",
+        )
+        msg = "✅ DB बैकअप फ़ाइल आपके प्राइवेट चैट में भेज दी गई है।"
+        if isinstance(reply_target, CallbackQuery):
+            await reply_target.answer("✅ बैकअप भेज दिया गया!", show_alert=False)
+            if reply_target.message and reply_target.message.chat.id != OWNER_ID:
+                await reply_target.message.reply_text(msg)
+        else:
+            if reply_target.chat.id != OWNER_ID:
+                await reply_target.reply_text(msg)
+    except RPCError as e:
+        err_text = (
+            f"❌ बैकअप भेजने में समस्या आई: `{e}`\n"
+            "कृपया पहले बॉट के प्राइवेट चैट में `/start` भेजें।"
+        )
+        if isinstance(reply_target, CallbackQuery):
+            await reply_target.answer("❌ बैकअप नहीं भेजा जा सका", show_alert=True)
+            if reply_target.message:
+                await reply_target.message.reply_text(err_text)
+        else:
+            await reply_target.reply_text(err_text)
+
+
+def get_stats_text() -> str:
+    data = load_data()
+    total_chats = len(data.get("chats", []))
+    total_locked = sum(len(v) for v in data.get("locked_mutes", {}).values())
+    return (
+        f"📊 **बॉट स्टैट्स**\n"
+        f"• जुड़े हुए ग्रुप्स/चैट्स: **{total_chats}**\n"
+        f"• एडमिन-लॉक्ड म्यूट यूज़र्स: **{total_locked}**"
+    )
+
+
+def get_help_text() -> str:
+    return (
+        "📌 **उपलब्ध कमांड्स:**\n"
+        "• `/start` या `/panel` — बटन मेनू खोलें\n"
+        "• `/addword <शब्द>` — प्रतिबंधित शब्द जोड़ें (Admin)\n"
+        "• `/delword <शब्द>` — प्रतिबंधित शब्द हटाएं (Admin)\n"
+        "• `/words` — प्रतिबंधित शब्दों की सूची देखें (Admin)\n"
+        "• `/unmute` (रिप्लाई या `/unmute <user_id>`) — सिर्फ़ Admin अनम्यूट कर सकते हैं\n"
+        "• `/stats` — स्टैट्स देखें (Owner)\n"
+        "• `/backup` — पूरी DB फ़ाइल बैकअप लें (Owner)\n"
+        "• `/broadcast <मैसेज>` — सभी जुड़े ग्रुप्स/चैट्स में ब्रॉडकास्ट करें (Owner)"
+    )
 
 
 # ================= MODERATION HELPERS =================
@@ -268,9 +353,7 @@ async def monitor_video_chats():
             pass
 
         await asyncio.sleep(VC_POLL_INTERVAL)
-
-
-# ================= DEBUG LOGGER =================
+        # ================= DEBUG LOGGER =================
 @bot.on_message(group=-1)
 async def debug_all_messages(client: Client, message: Message):
     uid = message.from_user.id if message.from_user else None
@@ -278,7 +361,13 @@ async def debug_all_messages(client: Client, message: Message):
     print(f"[BOT MSG] chat={cid} user={uid} text={message.text!r}")
 
 
-# ================= BOT COMMANDS & TEXT FILTER =================
+@bot.on_callback_query(group=-1)
+async def debug_all_callbacks(client: Client, callback_query: CallbackQuery):
+    uid = callback_query.from_user.id if callback_query.from_user else None
+    print(f"[BOT BTN] user={uid} data={callback_query.data!r}")
+
+
+# ================= BOT COMMANDS & BUTTON HANDLERS =================
 @bot.on_message(filters.new_chat_members)
 async def on_new_members(client: Client, message: Message):
     register_chat(message.chat.id)
@@ -288,49 +377,32 @@ async def on_new_members(client: Client, message: Message):
             await message.reply_text(
                 "👋 नमस्ते! बॉट सक्रिय हो गया है।\n"
                 "कृपया बॉट और असिस्टेंट दोनों को **Restrict Members** / **Manage Video Chats** परमिशन दें।\n"
-                "कमांड्स के लिए `/help` लिखें।"
+                "बटन और कमांड्स के लिए `/panel` या `/help` लिखें।"
             )
 
 
-@bot.on_message(filters.command("start") & filters.private)
-async def start_cmd(client: Client, message: Message):
+@bot.on_message(filters.command(["start", "panel"]))
+async def start_or_panel_cmd(client: Client, message: Message):
     register_chat(message.chat.id)
+    is_owner = bool(message.from_user and message.from_user.id == OWNER_ID)
     await message.reply_text(
-        "🛡️ **VC & Group Guard Bot** तैयार है!\n"
-        "किसी भी ग्रुप में बॉट और असिस्टेंट को जोड़कर एडमिन बनाएं—यह अपने आप काम शुरू कर देगा।"
+        "🛡️ **VC & Group Guard Bot** तैयार है!\nनीचे दिए गए बटन दबाकर सीधे काम करें:",
+        reply_markup=main_menu_keyboard(is_owner=is_owner),
     )
 
 
 @bot.on_message(filters.command("help"))
 async def help_cmd(client: Client, message: Message):
+    is_owner = bool(message.from_user and message.from_user.id == OWNER_ID)
     await message.reply_text(
-        "📌 **उपलब्ध कमांड्स:**\n"
-        "• `/addword <शब्द>` — प्रतिबंधित शब्द जोड़ें (Admin)\n"
-        "• `/delword <शब्द>` — प्रतिबंधित शब्द हटाएं (Admin)\n"
-        "• `/words` — प्रतिबंधित शब्दों की सूची देखें (Admin)\n"
-        "• `/unmute` (रिप्लाई करके या `/unmute <user_id>`) — सिर्फ़ Admin अनम्यूट कर सकते हैं\n"
-        "• `/stats` — स्टैट्स देखें (Owner)\n"
-        "• `/backup` — पूरी DB फ़ाइल बैकअप लें (Owner)\n"
-        "• `/broadcast <मैसेज>` — सभी जुड़े ग्रुप्स/चैट्स में ब्रॉडकास्ट करें (Owner)"
+        get_help_text(),
+        reply_markup=main_menu_keyboard(is_owner=is_owner),
     )
 
 
 @bot.on_message(filters.command("backup") & filters.user(OWNER_ID))
 async def backup_cmd(client: Client, message: Message):
-    load_data()
-    try:
-        await client.send_document(
-            chat_id=OWNER_ID,
-            document=DATA_FILE,
-            caption="💾 **बॉट DB बैकअप**\nयह आपकी मौजूदा डेटा फ़ाइल है—इसे सुरक्षित रखें।",
-        )
-        if message.chat.id != OWNER_ID:
-            await message.reply_text("✅ DB बैकअप फ़ाइल आपके प्राइवेट चैट में भेज दी गई है।")
-    except RPCError as e:
-        await message.reply_text(
-            f"❌ बैकअप भेजने में समस्या आई: `{e}`\n"
-            "कृपया पहले बॉट के प्राइवेट चैट में `/start` भेजें।"
-        )
+    await send_backup_to_owner(client, message)
 
 
 @bot.on_message(filters.command("addword") & filters.group)
@@ -373,12 +445,12 @@ async def delword_cmd(client: Client, message: Message):
         await message.reply_text("ℹ️ यह शब्द सूची में नहीं मिला।")
 
 
-@bot.on_message(filters.command("words") & filters.group)
+@bot.on_message(filters.command("words"))
 async def words_cmd(client: Client, message: Message):
     register_chat(message.chat.id)
     words = get_bad_words(message.chat.id)
     if not words:
-        await message.reply_text("इस ग्रुप में अभी कोई प्रतिबंधित शब्द नहीं जोड़ा गया है।")
+        await message.reply_text("इस चैट में अभी कोई प्रतिबंधित शब्द नहीं जोड़ा गया है।")
     else:
         await message.reply_text("🚫 **प्रतिबंधित शब्द:**\n" + ", ".join(f"`{w}`" for w in words))
 
@@ -413,14 +485,7 @@ async def unmute_cmd(client: Client, message: Message):
 
 @bot.on_message(filters.command("stats") & filters.user(OWNER_ID))
 async def stats_cmd(client: Client, message: Message):
-    data = load_data()
-    total_chats = len(data.get("chats", []))
-    total_locked = sum(len(v) for v in data.get("locked_mutes", {}).values())
-    await message.reply_text(
-        f"📊 **बॉट स्टैट्स**\n"
-        f"• जुड़े हुए ग्रुप्स/चैट्स: **{total_chats}**\n"
-        f"• एडमिन-लॉक्ड म्यूट यूज़र्स: **{total_locked}**"
-    )
+    await message.reply_text(get_stats_text())
 
 
 @bot.on_message(filters.command("broadcast") & filters.user(OWNER_ID))
@@ -451,6 +516,60 @@ async def broadcast_cmd(client: Client, message: Message):
             failed += 1
 
     await message.reply_text(f"📢 **ब्रॉडकास्ट पूरा हुआ**\n• सफल: {sent}\n• असफल: {failed}")
+
+
+@bot.on_callback_query()
+async def button_callback_handler(client: Client, callback_query: CallbackQuery):
+    data = callback_query.data
+    uid = callback_query.from_user.id if callback_query.from_user else 0
+    is_owner = uid == OWNER_ID
+    chat_id = callback_query.message.chat.id if callback_query.message else 0
+
+    if data == "btn_home":
+        await callback_query.answer()
+        if callback_query.message:
+            await callback_query.message.edit_text(
+                "🛡️ **VC & Group Guard Bot** तैयार है!\nनीचे दिए गए बटन दबाकर सीधे काम करें:",
+                reply_markup=main_menu_keyboard(is_owner=is_owner),
+            )
+        return
+
+    if data == "btn_help":
+        await callback_query.answer()
+        if callback_query.message:
+            await callback_query.message.edit_text(
+                get_help_text(),
+                reply_markup=back_keyboard(),
+            )
+        return
+
+    if data == "btn_words":
+        await callback_query.answer()
+        words = get_bad_words(chat_id) if chat_id else []
+        text = (
+            "इस चैट में अभी कोई प्रतिबंधित शब्द नहीं जोड़ा गया है।"
+            if not words
+            else "🚫 **प्रतिबंधित शब्द:**\n" + ", ".join(f"`{w}`" for w in words)
+        )
+        if callback_query.message:
+            await callback_query.message.edit_text(text, reply_markup=back_keyboard())
+        return
+
+    if data == "btn_stats":
+        if not is_owner:
+            await callback_query.answer("⛔ यह बटन केवल Owner के लिए है।", show_alert=True)
+            return
+        await callback_query.answer()
+        if callback_query.message:
+            await callback_query.message.edit_text(get_stats_text(), reply_markup=back_keyboard())
+        return
+
+    if data == "btn_backup":
+        if not is_owner:
+            await callback_query.answer("⛔ यह बटन केवल Owner के लिए है।", show_alert=True)
+            return
+        await send_backup_to_owner(client, callback_query)
+        return
 
 
 @bot.on_message(filters.group & filters.text & ~filters.service)
