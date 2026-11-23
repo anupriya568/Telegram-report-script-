@@ -238,7 +238,7 @@ def register_handlers(bot: Client, assistant: Client) -> None:
                     await reply_target.message.reply_text(err_text)
             else:
                 await reply_target.reply_text(err_text)
-                    @bot.on_message(group=-1)
+                @bot.on_message(group=-1)
     async def debug_msg(client: Client, message: Message):
         uid = message.from_user.id if message.from_user else None
         cid = message.chat.id if message.chat else None
