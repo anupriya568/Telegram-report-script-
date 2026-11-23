@@ -426,7 +426,7 @@ def detect_abuse(text: Optional[str], badwords: Iterable[str]) -> Optional[List[
 
     return sorted(set(matches)) if matches else None
     class ModerationEngine:
-    def __init__(self, bot: Bot, db: Database, notify_owner_cb=None) -> None:
+        def __init__(self, bot: Bot, db: Database, notify_owner_cb=None) -> None:
         self.bot = bot
         self.db = db
         self.notify_owner_cb = notify_owner_cb
