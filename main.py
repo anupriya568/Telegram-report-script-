@@ -192,18 +192,21 @@ class Database:
                 """,
                 (user_id, username or "", first_name or "", utc_now_iso()),
             )
+
         await self._run(_op)
 
     async def count_users(self) -> int:
         def _op(conn: sqlite3.Connection):
             row = conn.execute("SELECT COUNT(*) AS cnt FROM users").fetchone()
             return int(row["cnt"]) if row else 0
+
         return await self._run(_op)
 
     async def get_all_user_ids(self) -> List[int]:
         def _op(conn: sqlite3.Connection):
             rows = conn.execute("SELECT user_id FROM users").fetchall()
             return [int(r["user_id"]) for r in rows]
+
         return await self._run(_op)
 
     async def upsert_group(self, chat_id: int, title: str, is_bot_admin: bool) -> None:
@@ -224,6 +227,7 @@ class Database:
                 "INSERT OR IGNORE INTO group_settings (chat_id) VALUES (?)",
                 (chat_id,),
             )
+
         await self._run(_op)
 
     async def set_group_admin_status(self, chat_id: int, is_bot_admin: bool) -> None:
@@ -232,40 +236,51 @@ class Database:
                 "UPDATE groups_info SET is_bot_admin = ?, updated_at = ? WHERE chat_id = ?",
                 (1 if is_bot_admin else 0, utc_now_iso(), chat_id),
             )
+
         await self._run(_op)
 
     async def get_group(self, chat_id: int) -> Optional[Dict[str, Any]]:
         def _op(conn: sqlite3.Connection):
             row = conn.execute("SELECT * FROM groups_info WHERE chat_id = ?", (chat_id,)).fetchone()
             return dict(row) if row else None
+
         return await self._run(_op)
 
     async def count_groups(self) -> int:
         def _op(conn: sqlite3.Connection):
             row = conn.execute("SELECT COUNT(*) AS cnt FROM groups_info WHERE active = 1").fetchone()
             return int(row["cnt"]) if row else 0
+
         return await self._run(_op)
 
     async def get_all_group_ids(self) -> List[int]:
         def _op(conn: sqlite3.Connection):
             rows = conn.execute("SELECT chat_id FROM groups_info WHERE active = 1").fetchall()
             return [int(r["chat_id"]) for r in rows]
+
         return await self._run(_op)
 
     async def get_group_settings(self, chat_id: int) -> Dict[str, Any]:
         def _op(conn: sqlite3.Connection):
             conn.execute("INSERT OR IGNORE INTO group_settings (chat_id) VALUES (?)", (chat_id,))
             row = conn.execute("SELECT * FROM group_settings WHERE chat_id = ?", (chat_id,)).fetchone()
-            return dict(row) if row else {
-                "chat_id": chat_id,
-                "auto_abuse_mute": 1,
-                "auto_delete_abuse": 1,
-                "auto_camera_mute": 1,
-                "auto_vc_join": 1,
-            }
+            return (
+                dict(row)
+                if row
+                else {
+                    "chat_id": chat_id,
+                    "auto_abuse_mute": 1,
+                    "auto_delete_abuse": 1,
+                    "auto_camera_mute": 1,
+                    "auto_vc_join": 1,
+                }
+            )
+
         return await self._run(_op)
 
-    async def add_badword(self, chat_id: int, word: str, language: str = "multi", added_by: Optional[int] = None) -> bool:
+    async def add_badword(
+        self, chat_id: int, word: str, language: str = "multi", added_by: Optional[int] = None
+    ) -> bool:
         normalized = word.strip().lower()
         if not normalized:
             return False
@@ -279,6 +294,7 @@ class Database:
                 (chat_id, normalized, language, added_by, utc_now_iso()),
             )
             return cur.rowcount > 0
+
         return await self._run(_op)
 
     async def remove_badword(self, chat_id: int, word: str) -> bool:
@@ -290,6 +306,7 @@ class Database:
                 (chat_id, normalized),
             )
             return cur.rowcount > 0
+
         return await self._run(_op)
 
     async def list_badwords(self, chat_id: int) -> List[str]:
@@ -299,6 +316,7 @@ class Database:
                 (chat_id,),
             ).fetchall()
             return [str(r["word"]) for r in rows]
+
         return await self._run(_op)
 
     async def add_moderation_log(
@@ -320,6 +338,7 @@ class Database:
                 (chat_id, chat_title, user_id, username or "", action_type, reason, utc_now_iso()),
             )
             return int(cur.lastrowid)
+
         return await self._run(_op)
 
     async def get_recent_logs(self, limit: int = 10) -> List[Dict[str, Any]]:
@@ -329,6 +348,7 @@ class Database:
                 (limit,),
             ).fetchall()
             return [dict(r) for r in rows]
+
         return await self._run(_op)
 
     async def is_notification_enabled(self, key: str) -> bool:
@@ -338,6 +358,7 @@ class Database:
                 (key,),
             ).fetchone()
             return bool(row["enabled"]) if row else True
+
         return await self._run(_op)
 
     async def set_notification_pref(self, key: str, enabled: bool) -> None:
@@ -346,12 +367,14 @@ class Database:
                 "UPDATE notification_preferences SET enabled = ? WHERE key = ?",
                 (1 if enabled else 0, key),
             )
+
         await self._run(_op)
 
     async def get_notification_prefs(self) -> List[Dict[str, Any]]:
         def _op(conn: sqlite3.Connection):
             rows = conn.execute("SELECT * FROM notification_preferences ORDER BY key ASC").fetchall()
             return [dict(r) for r in rows]
+
         return await self._run(_op)
 
     async def record_broadcast(
@@ -372,12 +395,14 @@ class Database:
                 (category, message_text, target_scope, sent_count, failed_count, utc_now_iso()),
             )
             return int(cur.lastrowid)
+
         return await self._run(_op)
 
     async def is_maintenance_mode(self) -> bool:
         def _op(conn: sqlite3.Connection):
             row = conn.execute("SELECT value FROM bot_config WHERE key = 'maintenance_mode'").fetchone()
             return bool(row and str(row["value"]) == "1")
+
         return await self._run(_op)
 
     async def set_maintenance_mode(self, enabled: bool) -> None:
@@ -389,13 +414,27 @@ class Database:
                 """,
                 ("1" if enabled else "0",),
             )
+
         await self._run(_op)
 
 
 DEFAULT_BADWORDS: List[str] = [
-    "idiot", "moron", "stupid", "dumb", "bastard", "asshole",
-    "चूतिया", "भड़वा", "हरामी", "कमीना", "बेवकूफ",
-    "chutiya", "bhosdike", "harami", "kamina", "bewakoof",
+    "idiot",
+    "moron",
+    "stupid",
+    "dumb",
+    "bastard",
+    "asshole",
+    "चूतिया",
+    "भड़वा",
+    "हरामी",
+    "कमीना",
+    "बेवकूफ",
+    "chutiya",
+    "bhosdike",
+    "harami",
+    "kamina",
+    "bewakoof",
 ]
 
 
@@ -425,8 +464,8 @@ def detect_abuse(text: Optional[str], badwords: Iterable[str]) -> Optional[List[
             matches.append(word)
 
     return sorted(set(matches)) if matches else None
-    class ModerationEngine:
-        def __init__(self, bot: Bot, db: Database, notify_owner_cb=None) -> None:
+        class ModerationEngine:
+    def __init__(self, bot: Bot, db: Database, notify_owner_cb=None) -> None:
         self.bot = bot
         self.db = db
         self.notify_owner_cb = notify_owner_cb
@@ -529,7 +568,12 @@ def detect_abuse(text: Optional[str], badwords: Iterable[str]) -> Optional[List[
                 until_date=None,
             )
             await self.db.add_moderation_log(
-                chat_id, chat_title, user_id, username, action_type, f"{reason} (permanent mute until admin unmutes)"
+                chat_id,
+                chat_title,
+                user_id,
+                username,
+                action_type,
+                f"{reason} (permanent mute until admin unmutes)",
             )
             logger.info("PERMANENT MUTED user %s in '%s' (%s) | reason: %s", user_id, chat_title, chat_id, reason)
             return True
@@ -656,16 +700,32 @@ class AssistantVCController:
                         )
                     )
                     self._active_joins[chat_id] = call_id
-                    logger.info("VC_DEBUG: Assistant silently joined VC in '%s' (%s) on attempt %d.", chat_title, chat_id, attempt)
+                    logger.info(
+                        "VC_DEBUG: Assistant silently joined VC in '%s' (%s) on attempt %d.",
+                        chat_title,
+                        chat_id,
+                        attempt,
+                    )
                     return True
                 except (RPCError, Exception) as exc:
                     last_err = str(exc)
-                    logger.warning("VC_DEBUG: VC join attempt %d/%d failed in '%s': %s", attempt, self.max_retries, chat_title, last_err)
+                    logger.warning(
+                        "VC_DEBUG: VC join attempt %d/%d failed in '%s': %s",
+                        attempt,
+                        self.max_retries,
+                        chat_title,
+                        last_err,
+                    )
                     if attempt < self.max_retries:
                         await asyncio.sleep(self.retry_delay)
 
             await self.db.add_moderation_log(
-                chat_id, chat_title, None, None, "VC_JOIN_FAILED", f"Failed after {self.max_retries} retries: {last_err}"
+                chat_id,
+                chat_title,
+                None,
+                None,
+                "VC_JOIN_FAILED",
+                f"Failed after {self.max_retries} retries: {last_err}",
             )
             if self.notify_owner_cb:
                 await self.notify_owner_cb(
@@ -755,7 +815,12 @@ class AssistantVCController:
                 paused = bool(getattr(p, "video_paused", False))
                 logger.info(
                     "VC_DEBUG: Participant in '%s' (%s): user=%s video=%s camera=%s paused=%s",
-                    chat_title, chat_id, user_id, has_video, has_camera, paused,
+                    chat_title,
+                    chat_id,
+                    user_id,
+                    has_video,
+                    has_camera,
+                    paused,
                 )
 
                 if (has_video or has_camera) and not paused:
@@ -771,8 +836,7 @@ class AssistantVCController:
                         )
                         if muted:
                             self._muted_in_call[key] = True
-                            
-            def format_uptime(start_mono: float) -> str:
+                            def format_uptime(start_mono: float) -> str:
     sec = max(0, int(time.monotonic() - start_mono))
     d, rem = divmod(sec, 86400)
     h, rem = divmod(rem, 3600)
