@@ -48,7 +48,6 @@ def save_data(data: dict) -> None:
 
 
 def register_chat(chat_id: int) -> None:
-    # सिर्फ़ ग्रुप्स/सुपरग्रुप्स (negative chat_id) को VC/ग्रुप लिस्ट में रखें
     if not isinstance(chat_id, int) or chat_id >= 0:
         return
     data = load_data()
@@ -477,7 +476,6 @@ async def try_assistant_join_vc(chat_id: int, call) -> None:
     if call_id is None or call_id in joined_vc_calls:
         return
     try:
-        peer = await assistant.resolve_peer(chat_id)
         join_as = await assistant.resolve_peer("me")
         await assistant.invoke(
             functions.phone.JoinGroupCall(
@@ -489,7 +487,7 @@ async def try_assistant_join_vc(chat_id: int, call) -> None:
             )
         )
         joined_vc_calls.add(call_id)
-        print(f"[VC JOINED] Assistant joined VC in chat={chat_id} call_id={call_id}")
+        print(f"[VC JOINED] chat={chat_id} call_id={call_id}")
     except RPCError as e:
         print(f"[VC JOIN ERROR] chat={chat_id} call_id={call_id} err={e}")
 
@@ -515,7 +513,6 @@ async def monitor_video_chats() -> None:
                 if not call:
                     continue
 
-                # VC चालू दिखते ही असिस्टेंट को खुद से जॉइन कराने की कोशिश
                 await try_assistant_join_vc(chat_id, call)
 
                 participants_resp = await assistant.invoke(
@@ -582,5 +579,4 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
-    
+    asyncio.run(main()).
