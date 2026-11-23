@@ -273,7 +273,7 @@ async def debug_btn(client: Client, callback_query: CallbackQuery):
 @bot.on_message(filters.new_chat_members)
 async def on_new_members(client: Client, message: Message):
     register_chat(message.chat.id)
-    me = await bot.get_me()
+    me = await client.get_me()
     for member in message.new_chat_members:
         if member.id == me.id:
             await message.reply_text(
@@ -385,7 +385,7 @@ async def broadcast_cmd(client: Client, message: Message):
                 await message.reply_to_message.copy(chat_id)
             else:
                 text = message.text.split(None, 1)[1]
-                await bot.send_message(chat_id, text)
+                await client.send_message(chat_id, text)
             sent += 1
             await asyncio.sleep(0.15)
         except FloodWait as e:
@@ -461,57 +461,54 @@ async def filter_bad_words(client: Client, message: Message):
 async def monitor_video_chats() -> None:
     await asyncio.sleep(3)
     while True:
-        try:
-            data = load_data()
-            for chat_id in list(data.get("chats", [])):
-                try:
-                    chat = await assistant.get_chat(chat_id)
-                    if chat.type.name not in ("GROUP", "SUPERGROUP"):
-                        continue
-                    full_chat = await assistant.invoke(
-                        functions.channels.GetFullChannel(
-                            channel=await assistant.resolve_peer(chat_id)
-                        )
-                    )
-                    call = getattr(full_chat.full_chat, "call", None)
-                    if not call:
-                        continue
-                    participants_resp = await assistant.invoke(
-                        functions.phone.GetGroupParticipants(
-                            call=call, ids=[], sources=[], offset="", limit=100
-                        )
-                    )
-                    for p in participants_resp.participants:
-                        uid = p.peer.user_id if isinstance(p.peer, types.PeerUser) else None
-                        if not uid:
-                            continue
-                        if await is_chat_admin(chat_id, uid):
-                            continue
-                        camera_on = bool(getattr(p, "video", None))
-                        in_group = await is_group_member(chat_id, uid)
-                        if camera_on and get_locked_mute_reason(chat_id, uid) != "camera_on":
-                            await mute_user_locked(
-                                chat_id,
-                                uid,
-                                reason="camera_on",
-                                announce_text=f"📷 VC में कैमरा ऑन करने पर `{uid}` को म्यूट कर दिया गया है।",
-                            )
-                            continue
-                        if not in_group and get_locked_mute_reason(chat_id, uid) != "vc_without_group":
-                            await mute_user_locked(
-                                chat_id,
-                                uid,
-                                reason="vc_without_group",
-                                announce_text=f"🔇 बिना ग्रुप जॉइन किए VC में आने पर `{uid}` को म्यूट कर दिया गया है।",
-                            )
-                            continue
-                        if not get_locked_mute_reason(chat_id, uid):
-                            await unmute_user_admin(chat_id, uid, force_clear_lock=False)
-                except RPCError:
+        data = load_data()
+        for chat_id in list(data.get("chats", [])):
+            try:
+                chat = await assistant.get_chat(chat_id)
+                if chat.type.name not in ("GROUP", "SUPERGROUP"):
                     continue
-                await asyncio.sleep(0.3)
-        except Exception:
-            pass
+                full_chat = await assistant.invoke(
+                    functions.channels.GetFullChannel(
+                        channel=await assistant.resolve_peer(chat_id)
+                    )
+                )
+                call = getattr(full_chat.full_chat, "call", None)
+                if not call:
+                    continue
+                participants_resp = await assistant.invoke(
+                    functions.phone.GetGroupParticipants(
+                        call=call, ids=[], sources=[], offset="", limit=100
+                    )
+                )
+                for p in participants_resp.participants:
+                    uid = p.peer.user_id if isinstance(p.peer, types.PeerUser) else None
+                    if not uid:
+                        continue
+                    if await is_chat_admin(chat_id, uid):
+                        continue
+                    camera_on = bool(getattr(p, "video", None))
+                    in_group = await is_group_member(chat_id, uid)
+                    if camera_on and get_locked_mute_reason(chat_id, uid) != "camera_on":
+                        await mute_user_locked(
+                            chat_id,
+                            uid,
+                            reason="camera_on",
+                            announce_text=f"📷 VC में कैमरा ऑन करने पर `{uid}` को म्यूट कर दिया गया है।",
+                        )
+                        continue
+                    if not in_group and get_locked_mute_reason(chat_id, uid) != "vc_without_group":
+                        await mute_user_locked(
+                            chat_id,
+                            uid,
+                            reason="vc_without_group",
+                            announce_text=f"🔇 बिना ग्रुप जॉइन किए VC में आने पर `{uid}` को म्यूट कर दिया गया है।",
+                        )
+                        continue
+                    if not get_locked_mute_reason(chat_id, uid):
+                        await unmute_user_admin(chat_id, uid, force_clear_lock=False)
+            except RPCError as e:
+                print(f"[VC RPC ERROR] chat={chat_id} err={e}")
+            await asyncio.sleep(0.3)
         await asyncio.sleep(VC_POLL_INTERVAL)
 
 
@@ -520,13 +517,16 @@ async def main() -> None:
         print("कृपया config.py में SESSION_STRING डालें।")
         return
 
+    await bot.start()
+    me_b = await bot.get_me()
+    print(f"Bot ready: @{me_b.username} ({me_b.id})")
+
+    await assistant.start()
+    me_a = await assistant.get_me()
+    print(f"Assistant ready: {me_a.id}")
+
     vc_task = asyncio.create_task(monitor_video_chats())
     try:
-        await bot.start()
-        await assistant.start()
-        me_b = await bot.get_me()
-        me_a = await assistant.get_me()
-        print(f"Bot ready: @{me_b.username} | Assistant ready: {me_a.id}")
         await idle()
     finally:
         vc_task.cancel()
@@ -538,4 +538,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
+            
