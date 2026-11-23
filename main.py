@@ -1,582 +1,965 @@
 import asyncio
 import json
-import os
+import logging
+import re
+import signal
+import sqlite3
+import sys
+import time
+import unicodedata
+from datetime import datetime, timezone
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-try:
-    asyncio.get_event_loop()
-except RuntimeError:
-    asyncio.set_event_loop(asyncio.new_event_loop())
-
-from pyrogram import Client, filters, idle
-from pyrogram.errors import FloodWait, RPCError
-from pyrogram.raw import functions, types
-from pyrogram.types import (
-    CallbackQuery,
-    ChatPermissions,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Message,
+from telethon import TelegramClient, events
+from telethon.errors import RPCError
+from telethon.sessions import StringSession
+from telethon.tl.functions.phone import JoinGroupCallRequest, LeaveGroupCallRequest
+from telethon.tl.types import (
+    Channel,
+    Chat,
+    DataJSON,
+    GroupCall,
+    GroupCallDiscarded,
+    InputGroupCall,
+    UpdateGroupCall,
+    UpdateGroupCallParticipants,
+)
+from telegram import Bot, ChatPermissions, Message, Update
+from telegram.error import BadRequest, Forbidden, TelegramError
+from telegram.ext import (
+    Application,
+    ChatMemberHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
 )
 
-from config import (
-    API_HASH,
-    API_ID,
-    BOT_TOKEN,
-    DATA_FILE,
-    OWNER_ID,
-    SESSION_STRING,
-    VC_POLL_INTERVAL,
+import config as cfg
+
+logging.basicConfig(
+    level=getattr(logging, getattr(cfg, "LOG_LEVEL", "INFO").upper(), logging.INFO),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
+logger = logging.getLogger("modguard")
 
 
-def load_data() -> dict:
-    if not os.path.exists(DATA_FILE):
-        data = {"chats": [], "bad_words": {}, "locked_mutes": {}}
-        save_data(data)
-        return data
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    data.setdefault("chats", [])
-    data.setdefault("bad_words", {})
-    data.setdefault("locked_mutes", {})
-    return data
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
-def save_data(data: dict) -> None:
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+def normalize_channel_chat_id(channel_id: int) -> int:
+    s = str(channel_id)
+    if s.startswith("-100"):
+        return int(s)
+    return int(f"-100{abs(channel_id)}")
 
 
-def register_chat(chat_id: int) -> None:
-    if not isinstance(chat_id, int) or chat_id >= 0:
-        return
-    data = load_data()
-    if chat_id not in data["chats"]:
-        data["chats"].append(chat_id)
-        save_data(data)
+# ==============================================================================
+# 1. SQLITE DATABASE LAYER
+# ==============================================================================
+class Database:
+    def __init__(self, db_path: str) -> None:
+        self.db_path = db_path
+        self._lock = asyncio.Lock()
+        self._conn: Optional[sqlite3.Connection] = None
 
+    async def connect(self) -> None:
+        async with self._lock:
+            self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA journal_mode=WAL;")
+            self._conn.execute("PRAGMA foreign_keys=ON;")
+            self._create_tables()
+            self._seed_defaults()
+            self._conn.commit()
 
-def remove_chat(chat_id: int) -> None:
-    data = load_data()
-    if chat_id in data["chats"]:
-        data["chats"].remove(chat_id)
-        save_data(data)
+    async def close(self) -> None:
+        async with self._lock:
+            if self._conn is not None:
+                self._conn.close()
+                self._conn = None
 
+    def _create_tables(self) -> None:
+        assert self._conn is not None
+        self._conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                last_seen TEXT NOT NULL
+            );
 
-def add_bad_word(chat_id: int, word: str) -> bool:
-    data = load_data()
-    key = str(chat_id)
-    word = word.strip().lower()
-    if not word:
-        return False
-    words = data["bad_words"].setdefault(key, [])
-    if word not in words:
-        words.append(word)
-        save_data(data)
-        return True
-    return False
+            CREATE TABLE IF NOT EXISTS groups_info (
+                chat_id INTEGER PRIMARY KEY,
+                title TEXT NOT NULL,
+                is_bot_admin INTEGER NOT NULL DEFAULT 0,
+                active INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL
+            );
 
+            CREATE TABLE IF NOT EXISTS group_settings (
+                chat_id INTEGER PRIMARY KEY,
+                auto_abuse_mute INTEGER NOT NULL DEFAULT 1,
+                auto_delete_abuse INTEGER NOT NULL DEFAULT 1,
+                auto_camera_mute INTEGER NOT NULL DEFAULT 1,
+                auto_vc_join INTEGER NOT NULL DEFAULT 1,
+                FOREIGN KEY (chat_id) REFERENCES groups_info(chat_id) ON DELETE CASCADE
+            );
 
-def remove_bad_word(chat_id: int, word: str) -> bool:
-    data = load_data()
-    key = str(chat_id)
-    word = word.strip().lower()
-    words = data["bad_words"].get(key, [])
-    if word in words:
-        words.remove(word)
-        save_data(data)
-        return True
-    return False
+            CREATE TABLE IF NOT EXISTS custom_badwords (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                word TEXT NOT NULL,
+                language TEXT NOT NULL DEFAULT 'multi',
+                added_by INTEGER,
+                created_at TEXT NOT NULL,
+                UNIQUE(chat_id, word),
+                FOREIGN KEY (chat_id) REFERENCES groups_info(chat_id) ON DELETE CASCADE
+            );
 
+            CREATE TABLE IF NOT EXISTS moderation_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                chat_title TEXT NOT NULL,
+                user_id INTEGER,
+                username TEXT,
+                action_type TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
 
-def get_bad_words(chat_id: int) -> list[str]:
-    data = load_data()
-    return data["bad_words"].get(str(chat_id), [])
+            CREATE TABLE IF NOT EXISTS notification_preferences (
+                key TEXT PRIMARY KEY,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                description TEXT NOT NULL
+            );
 
+            CREATE TABLE IF NOT EXISTS broadcast_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category TEXT NOT NULL,
+                message_text TEXT NOT NULL,
+                target_scope TEXT NOT NULL,
+                sent_count INTEGER NOT NULL DEFAULT 0,
+                failed_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
 
-def set_locked_mute(chat_id: int, user_id: int, reason: str) -> None:
-    data = load_data()
-    c_key, u_key = str(chat_id), str(user_id)
-    data["locked_mutes"].setdefault(c_key, {})[u_key] = reason
-    save_data(data)
+            CREATE TABLE IF NOT EXISTS bot_config (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            """
+        )
 
-
-def clear_locked_mute(chat_id: int, user_id: int) -> None:
-    data = load_data()
-    c_key, u_key = str(chat_id), str(user_id)
-    if c_key in data["locked_mutes"] and u_key in data["locked_mutes"][c_key]:
-        del data["locked_mutes"][c_key][u_key]
-        save_data(data)
-
-
-def get_locked_mute_reason(chat_id: int, user_id: int) -> str | None:
-    data = load_data()
-    return data["locked_mutes"].get(str(chat_id), {}).get(str(user_id))
-
-
-def main_menu_keyboard(is_owner: bool = False) -> InlineKeyboardMarkup:
-    rows = [
-        [
-            InlineKeyboardButton("📌 Help", callback_data="btn_help"),
-            InlineKeyboardButton("🚫 Words", callback_data="btn_words"),
+    def _seed_defaults(self) -> None:
+        assert self._conn is not None
+        prefs = [
+            ("vc_join_failure", 1, "Assistant VC join retries fail hone par owner ko alert"),
+            ("bot_lost_admin", 1, "Main Bot ka admin role hatne par owner ko alert"),
+            ("critical_error", 1, "Critical technical errors par owner ko alert"),
+            ("system_failure", 1, "Important system failures par owner ko alert"),
         ]
-    ]
-    if is_owner:
-        rows.append(
-            [
-                InlineKeyboardButton("💾 Backup", callback_data="btn_backup"),
-                InlineKeyboardButton("📊 Stats", callback_data="btn_stats"),
-            ]
-        )
-    return InlineKeyboardMarkup(rows)
-
-
-def back_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("🔙 Back", callback_data="btn_home")]]
-    )
-
-
-def get_stats_text() -> str:
-    data = load_data()
-    total_chats = len([c for c in data.get("chats", []) if isinstance(c, int) and c < 0])
-    total_locked = sum(len(v) for v in data.get("locked_mutes", {}).values())
-    return (
-        f"📊 **Stats**\n"
-        f"• Groups: **{total_chats}**\n"
-        f"• Locked Mutes: **{total_locked}**"
-    )
-
-
-def get_help_text() -> str:
-    return (
-        "📌 **Commands**\n"
-        "• `/start` या `/panel` — बटन मेनू\n"
-        "• `/addword <word>` — शब्द जोड़ें (Group Admin)\n"
-        "• `/delword <word>` — शब्द हटाएं (Group Admin)\n"
-        "• `/words` — शब्द सूची देखें\n"
-        "• `/unmute` (रिप्लाई या `/unmute <id>`) — अनम्यूट (Group Admin)\n"
-        "• `/stats` — स्टैट्स (Owner)\n"
-        "• `/backup` — DB फ़ाइल भेजें (Owner)\n"
-        "• `/broadcast <msg>` — ब्रॉडकास्ट (Owner)"
-    )
-
-
-bot = Client(
-    "vc_guard_bot_client",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN,
-)
-
-assistant = Client(
-    "vc_guard_assistant_client",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    session_string=SESSION_STRING,
-)
-
-joined_vc_calls: set[int] = set()
-
-
-async def is_chat_admin(chat_id: int, user_id: int) -> bool:
-    if user_id == OWNER_ID:
-        return True
-    try:
-        member = await bot.get_chat_member(chat_id, user_id)
-        return member.status.name in ("ADMINISTRATOR", "OWNER")
-    except RPCError:
-        return False
-
-
-async def is_group_member(chat_id: int, user_id: int) -> bool:
-    try:
-        member = await bot.get_chat_member(chat_id, user_id)
-        return member.status.name not in ("LEFT", "BANNED")
-    except RPCError:
-        return False
-
-
-async def mute_user_locked(
-    chat_id: int, user_id: int, reason: str, announce_text: str | None = None
-) -> bool:
-    try:
-        await bot.restrict_chat_member(
-            chat_id=chat_id,
-            user_id=user_id,
-            permissions=ChatPermissions(),
-        )
-        set_locked_mute(chat_id, user_id, reason)
-        print(f"[MUTED] chat={chat_id} user={user_id} reason={reason}")
-        if announce_text:
-            await bot.send_message(chat_id, announce_text)
-        return True
-    except FloodWait as e:
-        await asyncio.sleep(e.value)
-        return False
-    except RPCError as e:
-        print(f"[MUTE ERROR] chat={chat_id} user={user_id} err={e}")
-        return False
-
-
-async def unmute_user_admin(
-    chat_id: int, user_id: int, force_clear_lock: bool = True
-) -> bool:
-    try:
-        await bot.restrict_chat_member(
-            chat_id=chat_id,
-            user_id=user_id,
-            permissions=ChatPermissions(
-                can_send_messages=True,
-                can_send_media_messages=True,
-                can_send_other_messages=True,
-                can_add_web_page_previews=True,
-            ),
-        )
-        if force_clear_lock:
-            clear_locked_mute(chat_id, user_id)
-        print(f"[UNMUTED] chat={chat_id} user={user_id}")
-        return True
-    except RPCError as e:
-        print(f"[UNMUTE ERROR] chat={chat_id} user={user_id} err={e}")
-        return False
-
-
-async def send_backup_to_owner(reply_target: Message | CallbackQuery) -> None:
-    load_data()
-    try:
-        await bot.send_document(
-            chat_id=OWNER_ID,
-            document=DATA_FILE,
-            caption="💾 **DB Backup**",
-        )
-        msg = "✅ Backup फ़ाइल आपकी प्राइवेट चैट में भेज दी गई है।"
-        if isinstance(reply_target, CallbackQuery):
-            await reply_target.answer("✅ Backup भेज दिया!", show_alert=False)
-            if reply_target.message and reply_target.message.chat.id != OWNER_ID:
-                await reply_target.message.reply_text(msg)
-        else:
-            if reply_target.chat.id != OWNER_ID:
-                await reply_target.reply_text(msg)
-    except RPCError as e:
-        err_text = f"❌ Backup एरर: `{e}`\nपहले बॉट के PM में `/start` भेजें।"
-        if isinstance(reply_target, CallbackQuery):
-            await reply_target.answer("❌ Backup नहीं भेजा जा सका", show_alert=True)
-            if reply_target.message:
-                await reply_target.message.reply_text(err_text)
-        else:
-            await reply_target.reply_text(err_text)
-
-
-@bot.on_message(group=-1)
-async def debug_msg(client: Client, message: Message):
-    uid = message.from_user.id if message.from_user else None
-    cid = message.chat.id if message.chat else None
-    print(f"[MSG] chat={cid} user={uid} text={message.text!r}")
-
-
-@bot.on_callback_query(group=-1)
-async def debug_btn(client: Client, callback_query: CallbackQuery):
-    uid = callback_query.from_user.id if callback_query.from_user else None
-    print(f"[BTN] user={uid} data={callback_query.data!r}")
-
-
-@bot.on_message(filters.new_chat_members)
-async def on_new_members(client: Client, message: Message):
-    register_chat(message.chat.id)
-    me = await client.get_me()
-    for member in message.new_chat_members:
-        if member.id == me.id:
-            await message.reply_text(
-                "👋 बॉट जुड़ गया! कृपया इसे **Restrict Members** और **Manage Video Chats** परमिशन दें।"
+        for key, enabled, desc in prefs:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO notification_preferences (key, enabled, description) VALUES (?, ?, ?)",
+                (key, enabled, desc),
             )
+        self._conn.execute(
+            "INSERT OR IGNORE INTO bot_config (key, value) VALUES ('maintenance_mode', '0')"
+        )
+
+    async def _run(self, fn, *args, **kwargs) -> Any:
+        async with self._lock:
+            if self._conn is None:
+                raise RuntimeError("Database connection is closed.")
+            res = fn(self._conn, *args, **kwargs)
+            self._conn.commit()
+            return res
+
+    async def upsert_user(self, user_id: int, username: Optional[str], first_name: Optional[str]) -> None:
+        def _op(conn: sqlite3.Connection):
+            conn.execute(
+                """
+                INSERT INTO users (user_id, username, first_name, last_seen)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    username = excluded.username,
+                    first_name = excluded.first_name,
+                    last_seen = excluded.last_seen
+                """,
+                (user_id, username or "", first_name or "", utc_now_iso()),
+            )
+        await self._run(_op)
+
+    async def count_users(self) -> int:
+        def _op(conn: sqlite3.Connection):
+            row = conn.execute("SELECT COUNT(*) AS cnt FROM users").fetchone()
+            return int(row["cnt"]) if row else 0
+        return await self._run(_op)
+
+    async def get_all_user_ids(self) -> List[int]:
+        def _op(conn: sqlite3.Connection):
+            rows = conn.execute("SELECT user_id FROM users").fetchall()
+            return [int(r["user_id"]) for r in rows]
+        return await self._run(_op)
+
+    async def upsert_group(self, chat_id: int, title: str, is_bot_admin: bool) -> None:
+        def _op(conn: sqlite3.Connection):
+            conn.execute(
+                """
+                INSERT INTO groups_info (chat_id, title, is_bot_admin, active, updated_at)
+                VALUES (?, ?, ?, 1, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    title = excluded.title,
+                    is_bot_admin = excluded.is_bot_admin,
+                    active = 1,
+                    updated_at = excluded.updated_at
+                """,
+                (chat_id, title, 1 if is_bot_admin else 0, utc_now_iso()),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO group_settings (chat_id) VALUES (?)",
+                (chat_id,),
+            )
+        await self._run(_op)
+
+    async def set_group_admin_status(self, chat_id: int, is_bot_admin: bool) -> None:
+        def _op(conn: sqlite3.Connection):
+            conn.execute(
+                "UPDATE groups_info SET is_bot_admin = ?, updated_at = ? WHERE chat_id = ?",
+                (1 if is_bot_admin else 0, utc_now_iso(), chat_id),
+            )
+        await self._run(_op)
+
+    async def get_group(self, chat_id: int) -> Optional[Dict[str, Any]]:
+        def _op(conn: sqlite3.Connection):
+            row = conn.execute("SELECT * FROM groups_info WHERE chat_id = ?", (chat_id,)).fetchone()
+            return dict(row) if row else None
+        return await self._run(_op)
+
+    async def count_groups(self) -> int:
+        def _op(conn: sqlite3.Connection):
+            row = conn.execute("SELECT COUNT(*) AS cnt FROM groups_info WHERE active = 1").fetchone()
+            return int(row["cnt"]) if row else 0
+        return await self._run(_op)
+
+    async def get_all_group_ids(self) -> List[int]:
+        def _op(conn: sqlite3.Connection):
+            rows = conn.execute("SELECT chat_id FROM groups_info WHERE active = 1").fetchall()
+            return [int(r["chat_id"]) for r in rows]
+        return await self._run(_op)
+
+    async def get_group_settings(self, chat_id: int) -> Dict[str, Any]:
+        def _op(conn: sqlite3.Connection):
+            conn.execute("INSERT OR IGNORE INTO group_settings (chat_id) VALUES (?)", (chat_id,))
+            row = conn.execute("SELECT * FROM group_settings WHERE chat_id = ?", (chat_id,)).fetchone()
+            return dict(row) if row else {
+                "chat_id": chat_id,
+                "auto_abuse_mute": 1,
+                "auto_delete_abuse": 1,
+                "auto_camera_mute": 1,
+                "auto_vc_join": 1,
+            }
+        return await self._run(_op)
+
+    async def add_badword(self, chat_id: int, word: str, language: str = "multi", added_by: Optional[int] = None) -> bool:
+        normalized = word.strip().lower()
+        if not normalized:
+            return False
+
+        def _op(conn: sqlite3.Connection):
+            cur = conn.execute(
+                """
+                INSERT OR IGNORE INTO custom_badwords (chat_id, word, language, added_by, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (chat_id, normalized, language, added_by, utc_now_iso()),
+            )
+            return cur.rowcount > 0
+        return await self._run(_op)
+
+    async def remove_badword(self, chat_id: int, word: str) -> bool:
+        normalized = word.strip().lower()
+
+        def _op(conn: sqlite3.Connection):
+            cur = conn.execute(
+                "DELETE FROM custom_badwords WHERE chat_id = ? AND word = ?",
+                (chat_id, normalized),
+            )
+            return cur.rowcount > 0
+        return await self._run(_op)
+
+    async def list_badwords(self, chat_id: int) -> List[str]:
+        def _op(conn: sqlite3.Connection):
+            rows = conn.execute(
+                "SELECT word FROM custom_badwords WHERE chat_id = ? ORDER BY word ASC",
+                (chat_id,),
+            ).fetchall()
+            return [str(r["word"]) for r in rows]
+        return await self._run(_op)
+
+    async def add_moderation_log(
+        self,
+        chat_id: int,
+        chat_title: str,
+        user_id: Optional[int],
+        username: Optional[str],
+        action_type: str,
+        reason: str,
+    ) -> int:
+        def _op(conn: sqlite3.Connection):
+            cur = conn.execute(
+                """
+                INSERT INTO moderation_logs
+                    (chat_id, chat_title, user_id, username, action_type, reason, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (chat_id, chat_title, user_id, username or "", action_type, reason, utc_now_iso()),
+            )
+            return int(cur.lastrowid)
+        return await self._run(_op)
+
+    async def get_recent_logs(self, limit: int = 10) -> List[Dict[str, Any]]:
+        def _op(conn: sqlite3.Connection):
+            rows = conn.execute(
+                "SELECT * FROM moderation_logs ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        return await self._run(_op)
+
+    async def is_notification_enabled(self, key: str) -> bool:
+        def _op(conn: sqlite3.Connection):
+            row = conn.execute(
+                "SELECT enabled FROM notification_preferences WHERE key = ?",
+                (key,),
+            ).fetchone()
+            return bool(row["enabled"]) if row else True
+        return await self._run(_op)
+
+    async def set_notification_pref(self, key: str, enabled: bool) -> None:
+        def _op(conn: sqlite3.Connection):
+            conn.execute(
+                "UPDATE notification_preferences SET enabled = ? WHERE key = ?",
+                (1 if enabled else 0, key),
+            )
+        await self._run(_op)
+
+    async def get_notification_prefs(self) -> List[Dict[str, Any]]:
+        def _op(conn: sqlite3.Connection):
+            rows = conn.execute("SELECT * FROM notification_preferences ORDER BY key ASC").fetchall()
+            return [dict(r) for r in rows]
+        return await self._run(_op)
+
+    async def record_broadcast(
+        self,
+        category: str,
+        message_text: str,
+        target_scope: str,
+        sent_count: int,
+        failed_count: int,
+    ) -> int:
+        def _op(conn: sqlite3.Connection):
+            cur = conn.execute(
+                """
+                INSERT INTO broadcast_records
+                    (category, message_text, target_scope, sent_count, failed_count, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (category, message_text, target_scope, sent_count, failed_count, utc_now_iso()),
+            )
+            return int(cur.lastrowid)
+        return await self._run(_op)
+
+    async def is_maintenance_mode(self) -> bool:
+        def _op(conn: sqlite3.Connection):
+            row = conn.execute("SELECT value FROM bot_config WHERE key = 'maintenance_mode'").fetchone()
+            return bool(row and str(row["value"]) == "1")
+        return await self._run(_op)
+
+    async def set_maintenance_mode(self, enabled: bool) -> None:
+        def _op(conn: sqlite3.Connection):
+            conn.execute(
+                """
+                INSERT INTO bot_config (key, value) VALUES ('maintenance_mode', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                ("1" if enabled else "0",),
+            )
+        await self._run(_op)
 
 
-@bot.on_message(filters.command(["start", "panel"]))
-async def start_or_panel_cmd(client: Client, message: Message):
-    register_chat(message.chat.id)
-    is_owner = bool(message.from_user and message.from_user.id == OWNER_ID)
-    await message.reply_text(
-        "🛡️ **VC & Group Guard Bot** तैयार है:",
-        reply_markup=main_menu_keyboard(is_owner=is_owner),
-    )
+# ==============================================================================
+# 2. HINDI + ENGLISH ABUSE DETECTION
+# ==============================================================================
+DEFAULT_BADWORDS: List[str] = [
+    "idiot", "moron", "stupid", "dumb", "bastard", "asshole",
+    "चूतिया", "भड़वा", "हरामी", "कमीना", "बेवकूफ",
+    "chutiya", "bhosdike", "harami", "kamina", "bewakoof",
+]
 
 
-@bot.on_message(filters.command("help"))
-async def help_cmd(client: Client, message: Message):
-    is_owner = bool(message.from_user and message.from_user.id == OWNER_ID)
-    await message.reply_text(
-        get_help_text(),
-        reply_markup=main_menu_keyboard(is_owner=is_owner),
-    )
+def normalize_text(text: str) -> str:
+    if not text:
+        return ""
+    norm = unicodedata.normalize("NFKC", text).lower()
+    return re.sub(r"\s+", " ", norm).strip()
 
 
-@bot.on_message(filters.command("backup") & filters.user(OWNER_ID))
-async def backup_cmd(client: Client, message: Message):
-    await send_backup_to_owner(message)
+def detect_abuse(text: Optional[str], badwords: Iterable[str]) -> Optional[List[str]]:
+    normalized = normalize_text(text or "")
+    if not normalized:
+        return None
 
-
-@bot.on_message(filters.command("addword") & filters.group)
-async def addword_cmd(client: Client, message: Message):
-    register_chat(message.chat.id)
-    if not message.from_user or not await is_chat_admin(message.chat.id, message.from_user.id):
-        await message.reply_text("⛔ यह कमांड केवल Admin के लिए है।")
-        return
-    if len(message.command) < 2:
-        await message.reply_text("उपयोग: `/addword <शब्द>`")
-        return
-    word = " ".join(message.command[1:])
-    if add_bad_word(message.chat.id, word):
-        await message.reply_text(f"✅ `{word}` जोड़ा गया।")
-    else:
-        await message.reply_text("ℹ️ पहले से मौजूद है।")
-
-
-@bot.on_message(filters.command("delword") & filters.group)
-async def delword_cmd(client: Client, message: Message):
-    register_chat(message.chat.id)
-    if not message.from_user or not await is_chat_admin(message.chat.id, message.from_user.id):
-        await message.reply_text("⛔ यह कमांड केवल Admin के लिए है।")
-        return
-    if len(message.command) < 2:
-        await message.reply_text("उपयोग: `/delword <शब्द>`")
-        return
-    word = " ".join(message.command[1:])
-    if remove_bad_word(message.chat.id, word):
-        await message.reply_text(f"🗑️ `{word}` हटाया गया।")
-    else:
-        await message.reply_text("ℹ️ सूची में नहीं मिला।")
-
-
-@bot.on_message(filters.command("words"))
-async def words_cmd(client: Client, message: Message):
-    register_chat(message.chat.id)
-    words = get_bad_words(message.chat.id)
-    if not words:
-        await message.reply_text("कोई प्रतिबंधित शब्द नहीं है।")
-    else:
-        await message.reply_text("🚫 **Words:** " + ", ".join(f"`{w}`" for w in words))
-
-
-@bot.on_message(filters.command("unmute") & filters.group)
-async def unmute_cmd(client: Client, message: Message):
-    register_chat(message.chat.id)
-    if not message.from_user or not await is_chat_admin(message.chat.id, message.from_user.id):
-        await message.reply_text("⛔ केवल Admin अनम्यूट कर सकते हैं।")
-        return
-    target_user_id = None
-    if message.reply_to_message and message.reply_to_message.from_user:
-        target_user_id = message.reply_to_message.from_user.id
-    elif len(message.command) >= 2 and message.command[1].isdigit():
-        target_user_id = int(message.command[1])
-    if not target_user_id:
-        await message.reply_text("मैसेज पर रिप्लाई करके `/unmute` या `/unmute <user_id>` लिखें।")
-        return
-    if await unmute_user_admin(message.chat.id, target_user_id, force_clear_lock=True):
-        await message.reply_text(f"🔊 `{target_user_id}` अनम्यूट हो गया।")
-    else:
-        await message.reply_text("❌ अनम्यूट नहीं हो सका (बॉट परमिशन चेक करें)।")
-
-
-@bot.on_message(filters.command("stats") & filters.user(OWNER_ID))
-async def stats_cmd(client: Client, message: Message):
-    await message.reply_text(get_stats_text())
-
-
-@bot.on_message(filters.command("broadcast") & filters.user(OWNER_ID))
-async def broadcast_cmd(client: Client, message: Message):
-    if len(message.command) < 2 and not message.reply_to_message:
-        await message.reply_text("उपयोग: `/broadcast <मैसेज>` या रिप्लाई करके `/broadcast` लिखें।")
-        return
-    data = load_data()
-    sent, failed = 0, 0
-    for chat_id in data.get("chats", []):
-        if not isinstance(chat_id, int) or chat_id >= 0:
+    matches: List[str] = []
+    for raw_word in badwords:
+        word = normalize_text(raw_word)
+        if not word:
             continue
+        escaped = re.escape(word)
+        if re.fullmatch(r"[a-z0-9_ ]+", word):
+            pattern = rf"(?<!\w){escaped}(?!\w)"
+        else:
+            pattern = rf"(?<![^\s]){escaped}(?![^\s])"
+        if re.search(pattern, normalized, flags=re.IGNORECASE):
+            matches.append(word)
+
+    return sorted(set(matches)) if matches else None
+
+
+# ==============================================================================
+# 3. MODERATION ENGINE (PERMANENT MUTE UNTIL ADMIN UNMUTES)
+# ==============================================================================
+class ModerationEngine:
+    def __init__(self, bot: Bot, db: Database, notify_owner_cb=None) -> None:
+        self.bot = bot
+        self.db = db
+        self.notify_owner_cb = notify_owner_cb
+        self._recent_actions: Dict[Tuple[int, Optional[int], str, str], float] = {}
+        self._lost_admin_notified: set[int] = set()
+        self._lock = asyncio.Lock()
+
+    async def _is_duplicate(
+        self, chat_id: int, user_id: Optional[int], action_type: str, dedup_key: str, ttl: float = 25.0
+    ) -> bool:
+        async with self._lock:
+            now = time.monotonic()
+            for k, ts in [k_ts for k_ts in self._recent_actions.items() if now - k_ts[1] > ttl]:
+                del self._recent_actions[k]
+            full_key = (chat_id, user_id, action_type, dedup_key)
+            if full_key in self._recent_actions:
+                return True
+            self._recent_actions[full_key] = now
+            return False
+
+    async def ensure_bot_is_admin(self, chat_id: int, chat_title: str) -> bool:
         try:
-            if message.reply_to_message:
-                await message.reply_to_message.copy(chat_id)
-            else:
-                text = message.text.split(None, 1)[1]
-                await client.send_message(chat_id, text)
-            sent += 1
-            await asyncio.sleep(0.15)
-        except FloodWait as e:
-            await asyncio.sleep(e.value)
-            failed += 1
-        except RPCError:
-            failed += 1
-    await message.reply_text(f"📢 Sent: {sent} | Failed: {failed}")
+            me = await self.bot.get_me()
+            member = await self.bot.get_chat_member(chat_id=chat_id, user_id=me.id)
+            is_admin = member.status in ("administrator", "creator")
+        except (Forbidden, BadRequest):
+            is_admin = False
+        except TelegramError as exc:
+            logger.error("Admin check error in %s: %s", chat_id, exc)
+            return False
 
+        await self.db.upsert_group(chat_id, chat_title, is_admin)
 
-@bot.on_callback_query()
-async def button_callback_handler(client: Client, callback_query: CallbackQuery):
-    data = callback_query.data
-    uid = callback_query.from_user.id if callback_query.from_user else 0
-    is_owner = uid == OWNER_ID
-    chat_id = callback_query.message.chat.id if callback_query.message else 0
+        if is_admin:
+            self._lost_admin_notified.discard(chat_id)
+            return True
 
-    if data == "btn_home":
-        await callback_query.answer()
-        if callback_query.message:
-            await callback_query.message.edit_text(
-                "🛡️ **VC & Group Guard Bot** तैयार है:",
-                reply_markup=main_menu_keyboard(is_owner=is_owner),
+        await self.db.set_group_admin_status(chat_id, False)
+        if chat_id not in self._lost_admin_notified:
+            self._lost_admin_notified.add(chat_id)
+            if self.notify_owner_cb:
+                await self.notify_owner_cb(
+                    "bot_lost_admin",
+                    f"⚠️ <b>MODGUARD Admin Permission Lost</b>\nGroup: <b>{chat_title}</b> (<code>{chat_id}</code>)",
+                )
+        return False
+
+    async def delete_message_safe(self, message: Message, chat_title: str, reason: str) -> bool:
+        chat_id = message.chat_id
+        user_id = message.from_user.id if message.from_user else None
+        username = message.from_user.username if message.from_user else None
+        if await self._is_duplicate(chat_id, user_id, "delete_message", str(message.message_id)):
+            return False
+        try:
+            await self.bot.delete_message(chat_id=chat_id, message_id=message.message_id)
+            await self.db.add_moderation_log(chat_id, chat_title, user_id, username, "DELETE_MESSAGE", reason)
+            return True
+        except (Forbidden, BadRequest, TelegramError) as exc:
+            logger.warning("Delete failed in %s: %s", chat_id, exc)
+            return False
+
+    async def restrict_user_permanent(
+        self,
+        chat_id: int,
+        chat_title: str,
+        user_id: int,
+        username: Optional[str],
+        action_type: str,
+        reason: str,
+    ) -> bool:
+        bucket = str(int(time.time() // 20))
+        if await self._is_duplicate(chat_id, user_id, action_type, bucket, ttl=20.0):
+            return False
+        try:
+            member = await self.bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+            if member.status in ("administrator", "creator"):
+                return False
+
+            perms = ChatPermissions(
+                can_send_messages=False,
+                can_send_audios=False,
+                can_send_documents=False,
+                can_send_photos=False,
+                can_send_videos=False,
+                can_send_video_notes=False,
+                can_send_voice_notes=False,
+                can_send_polls=False,
+                can_send_other_messages=False,
+                can_add_web_page_previews=False,
+                can_invite_users=False,
+                can_change_info=False,
+                can_pin_messages=False,
+                can_manage_topics=False,
             )
-    elif data == "btn_help":
-        await callback_query.answer()
-        if callback_query.message:
-            await callback_query.message.edit_text(get_help_text(), reply_markup=back_keyboard())
-    elif data == "btn_words":
-        await callback_query.answer()
-        words = get_bad_words(chat_id) if chat_id else []
-        txt = "कोई शब्द नहीं है।" if not words else "🚫 **Words:** " + ", ".join(f"`{w}`" for w in words)
-        if callback_query.message:
-            await callback_query.message.edit_text(txt, reply_markup=back_keyboard())
-    elif data == "btn_stats":
-        if not is_owner:
-            await callback_query.answer("⛔ सिर्फ़ Owner के लिए।", show_alert=True)
-            return
-        await callback_query.answer()
-        if callback_query.message:
-            await callback_query.message.edit_text(get_stats_text(), reply_markup=back_keyboard())
-    elif data == "btn_backup":
-        if not is_owner:
-            await callback_query.answer("⛔ सिर्फ़ Owner के लिए।", show_alert=True)
-            return
-        await send_backup_to_owner(callback_query)
+            # until_date=None keeps user muted permanently until an admin unmutes them
+            await self.bot.restrict_chat_member(
+                chat_id=chat_id,
+                user_id=user_id,
+                permissions=perms,
+                until_date=None,
+            )
+            await self.db.add_moderation_log(
+                chat_id, chat_title, user_id, username, action_type, f"{reason} (permanent mute until admin unmutes)"
+            )
+            return True
+        except (Forbidden, BadRequest, TelegramError) as exc:
+            logger.warning("Permanent mute failed for %s in %s: %s", user_id, chat_id, exc)
+            return False
 
 
-@bot.on_message(filters.group & filters.text & ~filters.service)
-async def filter_bad_words(client: Client, message: Message):
-    register_chat(message.chat.id)
-    if not message.from_user:
-        return
-    user_id = message.from_user.id
-    if await is_chat_admin(message.chat.id, user_id):
-        return
-    text_lower = message.text.lower()
-    for word in get_bad_words(message.chat.id):
-        if word in text_lower:
+# ==============================================================================
+# 4. ASSISTANT VOICE CHAT + CAMERA FLAG MONITOR (TELETHON MTPROTO)
+# ==============================================================================
+class AssistantVCController:
+    def __init__(
+        self,
+        api_id: int,
+        api_hash: str,
+        session_string: str,
+        db: Database,
+        moderation: ModerationEngine,
+        max_retries: int = 3,
+        retry_delay: int = 5,
+        notify_owner_cb=None,
+    ) -> None:
+        self.api_id = api_id
+        self.api_hash = api_hash
+        self.session_string = session_string
+        self.db = db
+        self.moderation = moderation
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
+        self.notify_owner_cb = notify_owner_cb
+
+        self.client: Optional[TelegramClient] = None
+        self._active_joins: Dict[int, int] = {}
+        self._join_locks: Dict[int, asyncio.Lock] = {}
+        self._muted_in_call: Dict[Tuple[int, int], bool] = {}
+
+    async def start(self) -> None:
+        if not self.session_string:
+            logger.warning("SESSION_STRING empty; Assistant VC monitor skipped.")
+            return
+        self.client = TelegramClient(StringSession(self.session_string), self.api_id, self.api_hash)
+        await self.client.start()
+        self.client.add_event_handler(self._on_raw_update, events.Raw)
+        logger.info("Assistant MTProto client connected.")
+
+    async def stop(self) -> None:
+        for chat_id in list(self._active_joins.keys()):
+            group = await self.db.get_group(chat_id)
+            await self.leave_vc(chat_id, group["title"] if group else str(chat_id))
+        if self.client and self.client.is_connected():
+            await self.client.disconnect()
+
+    async def join_vc(self, chat_id: int, chat_title: str, call_id: int, access_hash: int) -> bool:
+        if not self.client or not self.client.is_connected():
+            return False
+        if not await self.moderation.ensure_bot_is_admin(chat_id, chat_title):
+            return False
+        settings = await self.db.get_group_settings(chat_id)
+        if not settings.get("auto_vc_join", 1):
+            return False
+
+        lock = self._join_locks.setdefault(chat_id, asyncio.Lock())
+        async with lock:
+            if self._active_joins.get(chat_id) == call_id:
+                return True
+
+            last_err = ""
+            silent_params = DataJSON(data=json.dumps({"ufrag": "", "pwd": "", "fingerprints": [], "ssrc": 0}))
+            for attempt in range(1, self.max_retries + 1):
+                try:
+                    await self.client(
+                        JoinGroupCallRequest(
+                            call=InputGroupCall(id=call_id, access_hash=access_hash),
+                            join_as=await self.client.get_input_entity("me"),
+                            params=silent_params,
+                            muted=True,
+                            video_stopped=True,
+                        )
+                    )
+                    self._active_joins[chat_id] = call_id
+                    logger.info("Assistant silently joined VC in '%s' (attempt %d).", chat_title, attempt)
+                    return True
+                except (RPCError, Exception) as exc:
+                    last_err = str(exc)
+                    if attempt < self.max_retries:
+                        await asyncio.sleep(self.retry_delay)
+
+            await self.db.add_moderation_log(
+                chat_id, chat_title, None, None, "VC_JOIN_FAILED", f"Failed after {self.max_retries} retries: {last_err}"
+            )
+            if self.notify_owner_cb:
+                await self.notify_owner_cb(
+                    "vc_join_failure",
+                    f"❌ <b>Assistant VC Join Failed</b>\nGroup: <b>{chat_title}</b>\nError: <code>{last_err}</code>",
+                )
+            return False
+
+    async def leave_vc(self, chat_id: int, chat_title: str, call_id: Optional[int] = None) -> None:
+        active_id = call_id or self._active_joins.get(chat_id)
+        if not active_id:
+            return
+        try:
+            if self.client and self.client.is_connected():
+                await self.client(LeaveGroupCallRequest(call=InputGroupCall(id=active_id, access_hash=0), source=0))
+        except RPCError as exc:
+            logger.warning("Leave VC error in %s: %s", chat_id, exc)
+        finally:
+            self._active_joins.pop(chat_id, None)
+            for k in [k for k in self._muted_in_call if k[0] == chat_id]:
+                del self._muted_in_call[k]
+
+    async def _resolve_chat(self, update: Any) -> Tuple[Optional[int], str]:
+        raw_id = getattr(update, "chat_id", None)
+        if not raw_id:
+            return None, "Unknown Group"
+        chat_id = normalize_channel_chat_id(int(raw_id)) if int(raw_id) > 0 else int(raw_id)
+        db_group = await self.db.get_group(chat_id)
+        if db_group:
+            return chat_id, db_group["title"]
+        if self.client:
             try:
-                await message.delete()
-            except RPCError:
+                ent = await self.client.get_entity(chat_id)
+                if isinstance(ent, (Channel, Chat)):
+                    return chat_id, getattr(ent, "title", None) or str(chat_id)
+            except Exception:
                 pass
-            await mute_user_locked(
-                message.chat.id,
-                user_id,
-                reason=f"bad_word:{word}",
-                announce_text=f"🔇 प्रतिबंधित शब्द लिखने पर `{message.from_user.first_name}` को म्यूट कर दिया गया है।",
-            )
-            break
+        return chat_id, str(chat_id)
 
+    async def _on_raw_update(self, update: Any) -> None:
+        chat_id, chat_title = await self._resolve_chat(update)
+        if chat_id is None:
+            return
 
-async def try_assistant_join_vc(chat_id: int, call) -> None:
-    call_id = getattr(call, "id", None)
-    if call_id is None or call_id in joined_vc_calls:
-        return
-    try:
-        join_as = await assistant.resolve_peer("me")
-        await assistant.invoke(
-            functions.phone.JoinGroupCall(
-                call=call,
-                join_as=join_as,
-                params=types.DataJSON(data="{}"),
-                muted=True,
-                video_stopped=True,
-            )
-        )
-        joined_vc_calls.add(call_id)
-        print(f"[VC JOINED] chat={chat_id} call_id={call_id}")
-    except RPCError as e:
-        print(f"[VC JOIN ERROR] chat={chat_id} call_id={call_id} err={e}")
+        if isinstance(update, UpdateGroupCall):
+            call_obj = update.call
+            if isinstance(call_obj, GroupCallDiscarded):
+                await self.leave_vc(chat_id, chat_title, call_id=call_obj.id)
+            elif isinstance(call_obj, GroupCall):
+                group = await self.db.get_group(chat_id)
+                if group and group.get("is_bot_admin"):
+                    await self.join_vc(chat_id, chat_title, int(call_obj.id), int(call_obj.access_hash))
 
-
-async def monitor_video_chats() -> None:
-    await asyncio.sleep(3)
-    while True:
-        data = load_data()
-        for chat_id in list(data.get("chats", [])):
-            if not isinstance(chat_id, int) or chat_id >= 0:
-                remove_chat(chat_id)
-                continue
-            try:
-                chat = await assistant.get_chat(chat_id)
-                if chat.type.name not in ("GROUP", "SUPERGROUP"):
+        elif isinstance(update, UpdateGroupCallParticipants):
+            if not await self.moderation.ensure_bot_is_admin(chat_id, chat_title):
+                return
+            settings = await self.db.get_group_settings(chat_id)
+            if not settings.get("auto_camera_mute", 1):
+                return
+            for p in getattr(update, "participants", []) or []:
+                if getattr(p, "left", False):
                     continue
-                full_chat = await assistant.invoke(
-                    functions.channels.GetFullChannel(
-                        channel=await assistant.resolve_peer(chat_id)
-                    )
-                )
-                call = getattr(full_chat.full_chat, "call", None)
-                if not call:
+                user_id = getattr(getattr(p, "peer", None), "user_id", None)
+                if not user_id:
                     continue
-
-                await try_assistant_join_vc(chat_id, call)
-
-                participants_resp = await assistant.invoke(
-                    functions.phone.GetGroupParticipants(
-                        call=call, ids=[], sources=[], offset="", limit=100
-                    )
-                )
-                for p in participants_resp.participants:
-                    uid = p.peer.user_id if isinstance(p.peer, types.PeerUser) else None
-                    if not uid:
-                        continue
-                    if await is_chat_admin(chat_id, uid):
-                        continue
-                    camera_on = bool(getattr(p, "video", None))
-                    in_group = await is_group_member(chat_id, uid)
-                    if camera_on and get_locked_mute_reason(chat_id, uid) != "camera_on":
-                        await mute_user_locked(
-                            chat_id,
-                            uid,
-                            reason="camera_on",
-                            announce_text=f"📷 VC में कैमरा ऑन करने पर `{uid}` को म्यूट कर दिया गया है।",
+                has_video = bool(getattr(p, "video", False))
+                has_camera = bool(getattr(p, "camera", False))
+                paused = bool(getattr(p, "video_paused", False))
+                if (has_video or has_camera) and not paused:
+                    key = (chat_id, int(user_id))
+                    if not self._muted_in_call.get(key):
+                        muted = await self.moderation.restrict_user_permanent(
+                            chat_id=chat_id,
+                            chat_title=chat_title,
+                            user_id=int(user_id),
+                            username=None,
+                            action_type="AUTO_CAMERA_MUTE",
+                            reason="Participant video/camera flag active in group call",
                         )
-                        continue
-                    if not in_group and get_locked_mute_reason(chat_id, uid) != "vc_without_group":
-                        await mute_user_locked(
-                            chat_id,
-                            uid,
-                            reason="vc_without_group",
-                            announce_text=f"🔇 बिना ग्रुप जॉइन किए VC में आने पर `{uid}` को म्यूट कर दिया गया है।",
-                        )
-                        continue
-                    if not get_locked_mute_reason(chat_id, uid):
-                        await unmute_user_admin(chat_id, uid, force_clear_lock=False)
-            except RPCError as e:
-                if "PEER_ID_INVALID" in str(e):
-                    remove_chat(chat_id)
-                print(f"[VC RPC ERROR] chat={chat_id} err={e}")
-            await asyncio.sleep(0.3)
-        await asyncio.sleep(VC_POLL_INTERVAL)
+                        if muted:
+                            self._muted_in_call[key] = True
+
+
+# ==============================================================================
+# 5. MAIN BOT + OWNER ADMIN PANEL + BROADCASTS
+# ==============================================================================
+def format_uptime(start_mono: float) -> str:
+    sec = max(0, int(time.monotonic() - start_mono))
+    d, rem = divmod(sec, 86400)
+    h, rem = divmod(rem, 3600)
+    m, s = divmod(rem, 60)
+    return f"{d}d {h}h {m}m {s}s"
 
 
 async def main() -> None:
-    if not SESSION_STRING or SESSION_STRING == "YOUR_ASSISTANT_SESSION_STRING":
-        print("कृपया config.py में SESSION_STRING डालें।")
-        return
+    db = Database(getattr(cfg, "DB_PATH", "modguard.db"))
+    await db.connect()
 
-    await bot.start()
-    me_b = await bot.get_me()
-    print(f"Bot ready: @{me_b.username} ({me_b.id})")
+    start_mono = time.monotonic()
+    app = Application.builder().token(cfg.BOT_TOKEN).build()
 
-    await assistant.start()
-    me_a = await assistant.get_me()
-    print(f"Assistant ready: {me_a.id}")
+    async def notify_owner(event_key: str, text: str) -> None:
+        if not await db.is_notification_enabled(event_key):
+            return
+        try:
+            await app.bot.send_message(chat_id=cfg.OWNER_ID, text=text, parse_mode="HTML")
+        except Exception as exc:
+            logger.error("Owner alert failed (%s): %s", event_key, exc)
 
-    vc_task = asyncio.create_task(monitor_video_chats())
+    moderation = ModerationEngine(
+        bot=app.bot,
+        db=db,
+        notify_owner_cb=notify_owner,
+    )
+    vc_controller = AssistantVCController(
+        api_id=int(cfg.API_ID),
+        api_hash=str(cfg.API_HASH),
+        session_string=str(cfg.SESSION_STRING),
+        db=db,
+        moderation=moderation,
+        max_retries=int(getattr(cfg, "MAX_VC_JOIN_RETRIES", 3)),
+        retry_delay=int(getattr(cfg, "VC_RETRY_DELAY_SECONDS", 5)),
+        notify_owner_cb=notify_owner,
+    )
+
+    def is_owner(user_id: Optional[int]) -> bool:
+        return user_id is not None and int(user_id) == int(cfg.OWNER_ID)
+
+    async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if update.effective_user:
+            await db.upsert_user(update.effective_user.id, update.effective_user.username, update.effective_user.first_name)
+        if not is_owner(update.effective_user.id if update.effective_user else None) and await db.is_maintenance_mode():
+            await update.message.reply_text("🛠️ MODGUARD maintenance mode mein hai.")
+            return
+        await update.message.reply_text("🛡️ <b>MODGUARD</b> active hai.", parse_mode="HTML")
+
+    async def cmd_addbadword(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat, user = update.effective_chat, update.effective_user
+        if not chat or chat.type not in ("group", "supergroup") or not user:
+            return
+        member = await app.bot.get_chat_member(chat.id, user.id)
+        if member.status not in ("administrator", "creator") and not is_owner(user.id):
+            return
+        if not context.args:
+            await update.message.reply_text("Usage: <code>/addbadword word</code>", parse_mode="HTML")
+            return
+        word = " ".join(context.args)
+        ok = await db.add_badword(chat.id, word, added_by=user.id)
+        await update.message.reply_text("✅ Word added." if ok else "Already exists.", parse_mode="HTML")
+
+    async def cmd_delbadword(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat, user = update.effective_chat, update.effective_user
+        if not chat or chat.type not in ("group", "supergroup") or not user:
+            return
+        member = await app.bot.get_chat_member(chat.id, user.id)
+        if member.status not in ("administrator", "creator") and not is_owner(user.id):
+            return
+        if not context.args:
+            await update.message.reply_text("Usage: <code>/delbadword word</code>", parse_mode="HTML")
+            return
+        ok = await db.remove_badword(chat.id, " ".join(context.args))
+        await update.message.reply_text("🗑️ Word removed." if ok else "Not found.", parse_mode="HTML")
+
+    async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not update.effective_user or not is_owner(update.effective_user.id):
+            return
+        users_cnt = await db.count_users()
+        groups_cnt = await db.count_groups()
+        maint = await db.is_maintenance_mode()
+        await update.message.reply_text(
+            f"🛡️ <b>MODGUARD Admin Panel</b>\n"
+            f"• Users: <b>{users_cnt}</b>\n"
+            f"• Groups: <b>{groups_cnt}</b>\n"
+            f"• Maintenance: <b>{'ON' if maint else 'OFF'}</b>\n"
+            f"• Uptime: <b>{format_uptime(start_mono)}</b>\n\n"
+            f"/maintenance on|off | /broadcast [users|groups|all] msg | /updatecast [users|groups|all] msg | /logs [n] | /alerts",
+            parse_mode="HTML",
+        )
+
+    async def cmd_maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not update.effective_user or not is_owner(update.effective_user.id):
+            return
+        if not context.args or context.args[0].lower() not in ("on", "off"):
+            await update.message.reply_text("Usage: <code>/maintenance on|off</code>", parse_mode="HTML")
+            return
+        enabled = context.args[0].lower() == "on"
+        await db.set_maintenance_mode(enabled)
+        await update.message.reply_text(f"🔧 Maintenance mode: <b>{'ON' if enabled else 'OFF'}</b>", parse_mode="HTML")
+
+    async def do_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE, category: str) -> None:
+        if not update.effective_user or not is_owner(update.effective_user.id):
+            return
+        args = context.args or []
+        if not args:
+            return
+        scope = "all"
+        if args[0].lower() in ("users", "groups", "all"):
+            scope = args[0].lower()
+            text = " ".join(args[1:]).strip()
+        else:
+            text = " ".join(args).strip()
+        if not text:
+            return
+
+        targets: List[int] = []
+        if scope in ("users", "all"):
+            targets.extend(await db.get_all_user_ids())
+        if scope in ("groups", "all"):
+            targets.extend(await db.get_all_group_ids())
+        unique_targets = list(dict.fromkeys(targets))
+
+        sent = failed = 0
+        for tid in unique_targets:
+            try:
+                await app.bot.send_message(chat_id=tid, text=text, parse_mode="HTML")
+                sent += 1
+            except TelegramError:
+                failed += 1
+            await asyncio.sleep(0.05)
+
+        await db.record_broadcast(category, text, scope, sent, failed)
+        await update.message.reply_text(f"📢 Broadcast ({category}): sent={sent}, failed={failed}")
+
+    async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await do_broadcast(update, context, "admin_broadcast")
+
+    async def cmd_updatecast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await do_broadcast(update, context, "update_broadcast")
+
+    async def cmd_logs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not update.effective_user or not is_owner(update.effective_user.id):
+            return
+        limit = int(context.args[0]) if (context.args and context.args[0].isdigit()) else 10
+        rows = await db.get_recent_logs(max(1, min(30, limit)))
+        if not rows:
+            await update.message.reply_text("No logs.")
+            return
+        lines = [f"• [<code>{r['action_type']}</code>] <b>{r['chat_title']}</b>: {r['reason']}" for r in rows]
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    async def cmd_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not update.effective_user or not is_owner(update.effective_user.id):
+            return
+        if len(context.args) >= 2 and context.args[1].lower() in ("on", "off"):
+            await db.set_notification_pref(context.args[0], context.args[1].lower() == "on")
+        prefs = await db.get_notification_prefs()
+        lines = [f"• <code>{p['key']}</code>: <b>{'ON' if p['enabled'] else 'OFF'}</b>" for p in prefs]
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat = update.effective_chat
+        if chat and chat.type in ("group", "supergroup"):
+            await moderation.ensure_bot_is_admin(chat.id, chat.title or str(chat.id))
+
+    async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
+        if not msg or not chat or chat.type not in ("group", "supergroup"):
+            return
+        if user:
+            await db.upsert_user(user.id, user.username, user.first_name)
+        if await db.is_maintenance_mode():
+            return
+        title = chat.title or str(chat.id)
+        if not await moderation.ensure_bot_is_admin(chat.id, title):
+            return
+        text = msg.text or msg.caption
+        if not text:
+            return
+        custom = await db.list_badwords(chat.id)
+        matched = detect_abuse(text, set(DEFAULT_BADWORDS) | set(custom))
+        if not matched:
+            return
+        settings = await db.get_group_settings(chat.id)
+        reason = f"Abuse detected: {', '.join(matched)}"
+        if settings.get("auto_delete_abuse", 1):
+            await moderation.delete_message_safe(msg, title, reason)
+        if settings.get("auto_abuse_mute", 1) and user:
+            await moderation.restrict_user_permanent(
+                chat_id=chat.id,
+                chat_title=title,
+                user_id=user.id,
+                username=user.username,
+                action_type="AUTO_ABUSE_MUTE",
+                reason=reason,
+            )
+
+    async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.exception("Main Bot error: %s", context.error)
+        await notify_owner("critical_error", f"🚨 <b>Critical Error</b>\n<code>{context.error}</code>")
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("addbadword", cmd_addbadword))
+    app.add_handler(CommandHandler("delbadword", cmd_delbadword))
+    app.add_handler(CommandHandler("admin", cmd_admin))
+    app.add_handler(CommandHandler("maintenance", cmd_maintenance))
+    app.add_handler(CommandHandler("broadcast", cmd_broadcast))
+    app.add_handler(CommandHandler("updatecast", cmd_updatecast))
+    app.add_handler(CommandHandler("logs", cmd_logs))
+    app.add_handler(CommandHandler("alerts", cmd_alerts))
+    app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & (filters.TEXT | filters.CAPTION) & ~filters.COMMAND, on_group_message))
+    app.add_error_handler(on_error)
+
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+        except NotImplementedError:
+            pass
+
     try:
-        await idle()
+        await app.initialize()
+        await app.start()
+        assert app.updater is not None
+        await app.updater.start_polling(drop_pending_updates=True)
+        await vc_controller.start()
+        logger.info("MODGUARD running in single-file permanent-mute mode.")
+        await stop_event.wait()
+    except Exception as exc:
+        logger.exception("System failure: %s", exc)
+        await notify_owner("system_failure", f"💥 <b>System Failure</b>\n<code>{exc}</code>")
     finally:
-        vc_task.cancel()
-        if assistant.is_connected:
-            await assistant.stop()
-        if bot.is_connected:
-            await bot.stop()
+        await vc_controller.stop()
+        if app.updater and app.updater.running:
+            await app.updater.stop()
+        if app.running:
+            await app.shutdown()
+        await db.close()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        sys.exit(0)
+        
