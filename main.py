@@ -425,7 +425,7 @@ def detect_abuse(text: Optional[str], badwords: Iterable[str]) -> Optional[List[
             matches.append(word)
 
     return sorted(set(matches)) if matches else None
-                class ModerationEngine:
+    class ModerationEngine:
     def __init__(self, bot: Bot, db: Database, notify_owner_cb=None) -> None:
         self.bot = bot
         self.db = db
@@ -771,7 +771,8 @@ class AssistantVCController:
                         )
                         if muted:
                             self._muted_in_call[key] = True
-def format_uptime(start_mono: float) -> str:
+                            
+            def format_uptime(start_mono: float) -> str:
     sec = max(0, int(time.monotonic() - start_mono))
     d, rem = divmod(sec, 86400)
     h, rem = divmod(rem, 3600)
