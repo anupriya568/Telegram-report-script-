@@ -56,7 +56,7 @@ def normalize_channel_chat_id(channel_id: int) -> int:
 
 
 # ==============================================================================
-# 1. SQLITE DATABASE LAYER
+# 1. SQLITE DATABASE
 # ==============================================================================
 class Database:
     def __init__(self, db_path: str) -> None:
@@ -508,6 +508,7 @@ class ModerationEngine:
         try:
             member = await self.bot.get_chat_member(chat_id=chat_id, user_id=user_id)
             if member.status in ("administrator", "creator"):
+                logger.info("User %s is admin/creator in %s; skipping mute.", user_id, chat_id)
                 return False
 
             perms = ChatPermissions(
@@ -535,6 +536,7 @@ class ModerationEngine:
             await self.db.add_moderation_log(
                 chat_id, chat_title, user_id, username, action_type, f"{reason} (permanent mute until admin unmutes)"
             )
+            logger.info("PERMANENT MUTED user %s in '%s' (%s) | reason: %s", user_id, chat_title, chat_id, reason)
             return True
         except (Forbidden, BadRequest, TelegramError) as exc:
             logger.warning("Permanent mute failed for %s in %s: %s", user_id, chat_id, exc)
@@ -567,16 +569,17 @@ class AssistantVCController:
 
         self.client: Optional[TelegramClient] = None
         self._active_joins: Dict[int, int] = {}
+        self._known_calls: Dict[int, int] = {}
         self._join_locks: Dict[int, asyncio.Lock] = {}
         self._muted_in_call: Dict[Tuple[int, int], bool] = {}
 
     async def start(self) -> None:
-        cleaned_session = (self.session_string or "").strip()
-        if not cleaned_session:
-            logger.warning("SESSION_STRING empty; Assistant VC monitor skipped.")
+        cleaned = (self.session_string or "").strip()
+        if not cleaned:
+            logger.warning("SESSION_STRING empty; Assistant VC monitor disabled.")
             return
         try:
-            self.client = TelegramClient(StringSession(cleaned_session), self.api_id, self.api_hash)
+            self.client = TelegramClient(StringSession(cleaned), self.api_id, self.api_hash)
             await self.client.start()
             self.client.add_event_handler(self._on_raw_update, events.Raw)
             logger.info("Assistant MTProto client connected.")
@@ -595,6 +598,7 @@ class AssistantVCController:
         if not self.client or not self.client.is_connected():
             return False
         if not await self.moderation.ensure_bot_is_admin(chat_id, chat_title):
+            logger.info("Main Bot is not admin in '%s' (%s); skipping VC join.", chat_title, chat_id)
             return False
         settings = await self.db.get_group_settings(chat_id)
         if not settings.get("auto_vc_join", 1):
@@ -605,8 +609,10 @@ class AssistantVCController:
             if self._active_joins.get(chat_id) == call_id:
                 return True
 
+            self._known_calls[call_id] = chat_id
             last_err = ""
             silent_params = DataJSON(data=json.dumps({"ufrag": "", "pwd": "", "fingerprints": [], "ssrc": 0}))
+
             for attempt in range(1, self.max_retries + 1):
                 try:
                     await self.client(
@@ -619,10 +625,11 @@ class AssistantVCController:
                         )
                     )
                     self._active_joins[chat_id] = call_id
-                    logger.info("Assistant silently joined VC in '%s' (attempt %d).", chat_title, attempt)
+                    logger.info("Assistant silently joined VC in '%s' (%s) on attempt %d.", chat_title, chat_id, attempt)
                     return True
                 except (RPCError, Exception) as exc:
                     last_err = str(exc)
+                    logger.warning("VC join attempt %d/%d failed in '%s': %s", attempt, self.max_retries, chat_title, last_err)
                     if attempt < self.max_retries:
                         await asyncio.sleep(self.retry_delay)
 
@@ -643,21 +650,34 @@ class AssistantVCController:
         try:
             if self.client and self.client.is_connected():
                 await self.client(LeaveGroupCallRequest(call=InputGroupCall(id=active_id, access_hash=0), source=0))
+            logger.info("Assistant left VC in '%s' (%s).", chat_title, chat_id)
         except RPCError as exc:
             logger.warning("Leave VC error in %s: %s", chat_id, exc)
         finally:
             self._active_joins.pop(chat_id, None)
+            self._known_calls.pop(active_id, None)
             for k in [k for k in self._muted_in_call if k[0] == chat_id]:
                 del self._muted_in_call[k]
 
     async def _resolve_chat(self, update: Any) -> Tuple[Optional[int], str]:
         raw_id = getattr(update, "chat_id", None)
-        if not raw_id:
+        chat_id: Optional[int] = None
+
+        if raw_id:
+            chat_id = normalize_channel_chat_id(int(raw_id)) if int(raw_id) > 0 else int(raw_id)
+        else:
+            call_obj = getattr(update, "call", None)
+            call_id = getattr(call_obj, "id", None)
+            if call_id and int(call_id) in self._known_calls:
+                chat_id = self._known_calls[int(call_id)]
+
+        if chat_id is None:
             return None, "Unknown Group"
-        chat_id = normalize_channel_chat_id(int(raw_id)) if int(raw_id) > 0 else int(raw_id)
+
         db_group = await self.db.get_group(chat_id)
         if db_group:
             return chat_id, db_group["title"]
+
         if self.client:
             try:
                 ent = await self.client.get_entity(chat_id)
@@ -665,6 +685,7 @@ class AssistantVCController:
                     return chat_id, getattr(ent, "title", None) or str(chat_id)
             except Exception:
                 pass
+
         return chat_id, str(chat_id)
 
     async def _on_raw_update(self, update: Any) -> None:
@@ -675,11 +696,9 @@ class AssistantVCController:
         if isinstance(update, UpdateGroupCall):
             call_obj = update.call
             if isinstance(call_obj, GroupCallDiscarded):
-                await self.leave_vc(chat_id, chat_title, call_id=call_obj.id)
+                await self.leave_vc(chat_id, chat_title, call_id=int(call_obj.id))
             elif isinstance(call_obj, GroupCall):
-                group = await self.db.get_group(chat_id)
-                if group and group.get("is_bot_admin"):
-                    await self.join_vc(chat_id, chat_title, int(call_obj.id), int(call_obj.access_hash))
+                await self.join_vc(chat_id, chat_title, int(call_obj.id), int(call_obj.access_hash))
 
         elif isinstance(update, UpdateGroupCallParticipants):
             if not await self.moderation.ensure_bot_is_admin(chat_id, chat_title):
@@ -687,15 +706,22 @@ class AssistantVCController:
             settings = await self.db.get_group_settings(chat_id)
             if not settings.get("auto_camera_mute", 1):
                 return
+
             for p in getattr(update, "participants", []) or []:
                 if getattr(p, "left", False):
                     continue
                 user_id = getattr(getattr(p, "peer", None), "user_id", None)
                 if not user_id:
                     continue
+
                 has_video = bool(getattr(p, "video", False))
                 has_camera = bool(getattr(p, "camera", False))
                 paused = bool(getattr(p, "video_paused", False))
+                logger.info(
+                    "VC participant update in '%s' (%s): user=%s video=%s camera=%s paused=%s",
+                    chat_title, chat_id, user_id, has_video, has_camera, paused,
+                )
+
                 if (has_video or has_camera) and not paused:
                     key = (chat_id, int(user_id))
                     if not self._muted_in_call.get(key):
@@ -709,7 +735,7 @@ class AssistantVCController:
                         )
                         if muted:
                             self._muted_in_call[key] = True
-                # ==============================================================================
+                          # ==============================================================================
 # 5. MAIN BOT + OWNER ADMIN PANEL + BROADCASTS
 # ==============================================================================
 def format_uptime(start_mono: float) -> str:
@@ -756,11 +782,29 @@ async def main() -> None:
 
     async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if update.effective_user:
-            await db.upsert_user(update.effective_user.id, update.effective_user.username, update.effective_user.first_name)
+            await db.upsert_user(
+                update.effective_user.id,
+                update.effective_user.username,
+                update.effective_user.first_name,
+            )
         if not is_owner(update.effective_user.id if update.effective_user else None) and await db.is_maintenance_mode():
-            await update.message.reply_text("🛠️ MODGUARD maintenance mode mein hai.")
+            if update.message:
+                await update.message.reply_text("🛠️ MODGUARD maintenance mode mein hai.")
             return
-        await update.message.reply_text("🛡️ <b>MODGUARD</b> active hai.", parse_mode="HTML")
+
+        chat = update.effective_chat
+        if chat and chat.type in ("group", "supergroup"):
+            is_adm = await moderation.ensure_bot_is_admin(chat.id, chat.title or str(chat.id))
+            if update.message:
+                status_text = "Admin hai (DB synced: is_bot_admin=1)" if is_adm else "Admin nahi hai (is_bot_admin=0)"
+                await update.message.reply_text(
+                    f"🛡️ <b>MODGUARD</b> group mein active hai. {status_text}",
+                    parse_mode="HTML",
+                )
+            return
+
+        if update.message:
+            await update.message.reply_text("🛡️ <b>MODGUARD</b> active hai.", parse_mode="HTML")
 
     async def cmd_addbadword(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat, user = update.effective_chat, update.effective_user
@@ -942,8 +986,13 @@ async def main() -> None:
         await app.start()
         assert app.updater is not None
         await app.updater.start_polling(drop_pending_updates=True)
+
+        for gid in await db.get_all_group_ids():
+            grp = await db.get_group(gid)
+            await moderation.ensure_bot_is_admin(gid, grp["title"] if grp else str(gid))
+
         await vc_controller.start()
-        logger.info("MODGUARD running in 3-part merged permanent-mute mode.")
+        logger.info("MODGUARD running.")
         await stop_event.wait()
     except Exception as exc:
         logger.exception("System failure: %s", exc)
@@ -963,4 +1012,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         sys.exit(0)
-    
+                                       
