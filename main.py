@@ -427,9 +427,7 @@ def detect_abuse(text: Optional[str], badwords: Iterable[str]) -> Optional[List[
             matches.append(word)
 
     return sorted(set(matches)) if matches else None
-
-
-# ==============================================================================
+    # ==============================================================================
 # 3. MODERATION ENGINE (PERMANENT MUTE UNTIL ADMIN UNMUTES)
 # ==============================================================================
 class ModerationEngine:
@@ -528,7 +526,6 @@ class ModerationEngine:
                 can_pin_messages=False,
                 can_manage_topics=False,
             )
-            # until_date=None keeps user muted permanently until an admin unmutes them
             await self.bot.restrict_chat_member(
                 chat_id=chat_id,
                 user_id=user_id,
@@ -574,13 +571,18 @@ class AssistantVCController:
         self._muted_in_call: Dict[Tuple[int, int], bool] = {}
 
     async def start(self) -> None:
-        if not self.session_string:
+        cleaned_session = (self.session_string or "").strip()
+        if not cleaned_session:
             logger.warning("SESSION_STRING empty; Assistant VC monitor skipped.")
             return
-        self.client = TelegramClient(StringSession(self.session_string), self.api_id, self.api_hash)
-        await self.client.start()
-        self.client.add_event_handler(self._on_raw_update, events.Raw)
-        logger.info("Assistant MTProto client connected.")
+        try:
+            self.client = TelegramClient(StringSession(cleaned_session), self.api_id, self.api_hash)
+            await self.client.start()
+            self.client.add_event_handler(self._on_raw_update, events.Raw)
+            logger.info("Assistant MTProto client connected.")
+        except Exception as exc:
+            logger.error("Assistant MTProto start failed (check SESSION_STRING): %s", exc)
+            self.client = None
 
     async def stop(self) -> None:
         for chat_id in list(self._active_joins.keys()):
@@ -707,9 +709,7 @@ class AssistantVCController:
                         )
                         if muted:
                             self._muted_in_call[key] = True
-
-
-# ==============================================================================
+                # ==============================================================================
 # 5. MAIN BOT + OWNER ADMIN PANEL + BROADCASTS
 # ==============================================================================
 def format_uptime(start_mono: float) -> str:
@@ -943,7 +943,7 @@ async def main() -> None:
         assert app.updater is not None
         await app.updater.start_polling(drop_pending_updates=True)
         await vc_controller.start()
-        logger.info("MODGUARD running in single-file permanent-mute mode.")
+        logger.info("MODGUARD running in 3-part merged permanent-mute mode.")
         await stop_event.wait()
     except Exception as exc:
         logger.exception("System failure: %s", exc)
@@ -953,7 +953,8 @@ async def main() -> None:
         if app.updater and app.updater.running:
             await app.updater.stop()
         if app.running:
-            await app.shutdown()
+            await app.stop()
+        await app.shutdown()
         await db.close()
 
 
@@ -962,4 +963,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         sys.exit(0)
-        
+    
