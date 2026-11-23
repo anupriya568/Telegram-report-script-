@@ -1,2 +1,3 @@
-pyrogram
-tgcrypto
+telethon
+python-telegram-bot
+
