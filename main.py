@@ -29,7 +29,6 @@ from config import (
 )
 
 
-# ================= DATA / DATABASE =================
 def load_data() -> dict:
     if not os.path.exists(DATA_FILE):
         data = {"chats": [], "bad_words": {}, "locked_mutes": {}}
@@ -106,7 +105,6 @@ def get_locked_mute_reason(chat_id: int, user_id: int) -> str | None:
     return data["locked_mutes"].get(str(chat_id), {}).get(str(user_id))
 
 
-# ================= KEYBOARDS / BUTTONS =================
 def main_menu_keyboard(is_owner: bool = False) -> InlineKeyboardMarkup:
     rows = [
         [
@@ -238,7 +236,8 @@ def register_handlers(bot: Client, assistant: Client) -> None:
                     await reply_target.message.reply_text(err_text)
             else:
                 await reply_target.reply_text(err_text)
-                @bot.on_message(group=-1)
+
+    @bot.on_message(group=-1)
     async def debug_msg(client: Client, message: Message):
         uid = message.from_user.id if message.from_user else None
         cid = message.chat.id if message.chat else None
@@ -555,4 +554,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
