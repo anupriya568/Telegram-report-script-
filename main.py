@@ -48,9 +48,19 @@ def save_data(data: dict) -> None:
 
 
 def register_chat(chat_id: int) -> None:
+    # सिर्फ़ ग्रुप्स/सुपरग्रुप्स (negative chat_id) को VC/ग्रुप लिस्ट में रखें
+    if not isinstance(chat_id, int) or chat_id >= 0:
+        return
     data = load_data()
     if chat_id not in data["chats"]:
         data["chats"].append(chat_id)
+        save_data(data)
+
+
+def remove_chat(chat_id: int) -> None:
+    data = load_data()
+    if chat_id in data["chats"]:
+        data["chats"].remove(chat_id)
         save_data(data)
 
 
@@ -130,11 +140,11 @@ def back_keyboard() -> InlineKeyboardMarkup:
 
 def get_stats_text() -> str:
     data = load_data()
-    total_chats = len(data.get("chats", []))
+    total_chats = len([c for c in data.get("chats", []) if isinstance(c, int) and c < 0])
     total_locked = sum(len(v) for v in data.get("locked_mutes", {}).values())
     return (
         f"📊 **Stats**\n"
-        f"• Chats: **{total_chats}**\n"
+        f"• Groups: **{total_chats}**\n"
         f"• Locked Mutes: **{total_locked}**"
     )
 
@@ -166,6 +176,8 @@ assistant = Client(
     api_hash=API_HASH,
     session_string=SESSION_STRING,
 )
+
+joined_vc_calls: set[int] = set()
 
 
 async def is_chat_admin(chat_id: int, user_id: int) -> bool:
@@ -380,6 +392,8 @@ async def broadcast_cmd(client: Client, message: Message):
     data = load_data()
     sent, failed = 0, 0
     for chat_id in data.get("chats", []):
+        if not isinstance(chat_id, int) or chat_id >= 0:
+            continue
         try:
             if message.reply_to_message:
                 await message.reply_to_message.copy(chat_id)
@@ -458,11 +472,36 @@ async def filter_bad_words(client: Client, message: Message):
             break
 
 
+async def try_assistant_join_vc(chat_id: int, call) -> None:
+    call_id = getattr(call, "id", None)
+    if call_id is None or call_id in joined_vc_calls:
+        return
+    try:
+        peer = await assistant.resolve_peer(chat_id)
+        join_as = await assistant.resolve_peer("me")
+        await assistant.invoke(
+            functions.phone.JoinGroupCall(
+                call=call,
+                join_as=join_as,
+                params=types.DataJSON(data="{}"),
+                muted=True,
+                video_stopped=True,
+            )
+        )
+        joined_vc_calls.add(call_id)
+        print(f"[VC JOINED] Assistant joined VC in chat={chat_id} call_id={call_id}")
+    except RPCError as e:
+        print(f"[VC JOIN ERROR] chat={chat_id} call_id={call_id} err={e}")
+
+
 async def monitor_video_chats() -> None:
     await asyncio.sleep(3)
     while True:
         data = load_data()
         for chat_id in list(data.get("chats", [])):
+            if not isinstance(chat_id, int) or chat_id >= 0:
+                remove_chat(chat_id)
+                continue
             try:
                 chat = await assistant.get_chat(chat_id)
                 if chat.type.name not in ("GROUP", "SUPERGROUP"):
@@ -475,6 +514,10 @@ async def monitor_video_chats() -> None:
                 call = getattr(full_chat.full_chat, "call", None)
                 if not call:
                     continue
+
+                # VC चालू दिखते ही असिस्टेंट को खुद से जॉइन कराने की कोशिश
+                await try_assistant_join_vc(chat_id, call)
+
                 participants_resp = await assistant.invoke(
                     functions.phone.GetGroupParticipants(
                         call=call, ids=[], sources=[], offset="", limit=100
@@ -507,6 +550,8 @@ async def monitor_video_chats() -> None:
                     if not get_locked_mute_reason(chat_id, uid):
                         await unmute_user_admin(chat_id, uid, force_clear_lock=False)
             except RPCError as e:
+                if "PEER_ID_INVALID" in str(e):
+                    remove_chat(chat_id)
                 print(f"[VC RPC ERROR] chat={chat_id} err={e}")
             await asyncio.sleep(0.3)
         await asyncio.sleep(VC_POLL_INTERVAL)
@@ -538,4 +583,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-            
+    
