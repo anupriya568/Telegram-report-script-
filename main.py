@@ -13,6 +13,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from telethon import TelegramClient, events
 from telethon.errors import RPCError
 from telethon.sessions import StringSession
+from telethon.tl.functions.channels import GetFullChannelRequest
+from telethon.tl.functions.messages import GetFullChatRequest
 from telethon.tl.functions.phone import JoinGroupCallRequest, LeaveGroupCallRequest
 from telethon.tl.types import (
     Channel,
@@ -41,6 +43,8 @@ logging.basicConfig(
     level=getattr(logging, getattr(cfg, "LOG_LEVEL", "INFO").upper(), logging.INFO),
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger("modguard")
 
 
@@ -55,9 +59,6 @@ def normalize_channel_chat_id(channel_id: int) -> int:
     return int(f"-100{abs(channel_id)}")
 
 
-# ==============================================================================
-# 1. SQLITE DATABASE
-# ==============================================================================
 class Database:
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
@@ -391,9 +392,6 @@ class Database:
         await self._run(_op)
 
 
-# ==============================================================================
-# 2. HINDI + ENGLISH ABUSE DETECTION
-# ==============================================================================
 DEFAULT_BADWORDS: List[str] = [
     "idiot", "moron", "stupid", "dumb", "bastard", "asshole",
     "चूतिया", "भड़वा", "हरामी", "कमीना", "बेवकूफ",
@@ -427,10 +425,7 @@ def detect_abuse(text: Optional[str], badwords: Iterable[str]) -> Optional[List[
             matches.append(word)
 
     return sorted(set(matches)) if matches else None
-    # ==============================================================================
-# 3. MODERATION ENGINE (PERMANENT MUTE UNTIL ADMIN UNMUTES)
-# ==============================================================================
-class ModerationEngine:
+                class ModerationEngine:
     def __init__(self, bot: Bot, db: Database, notify_owner_cb=None) -> None:
         self.bot = bot
         self.db = db
@@ -543,9 +538,6 @@ class ModerationEngine:
             return False
 
 
-# ==============================================================================
-# 4. ASSISTANT VOICE CHAT + CAMERA FLAG MONITOR (TELETHON MTPROTO)
-# ==============================================================================
 class AssistantVCController:
     def __init__(
         self,
@@ -576,16 +568,53 @@ class AssistantVCController:
     async def start(self) -> None:
         cleaned = (self.session_string or "").strip()
         if not cleaned:
-            logger.warning("SESSION_STRING empty; Assistant VC monitor disabled.")
+            logger.warning("VC_DEBUG: SESSION_STRING empty; Assistant VC monitor disabled.")
             return
         try:
             self.client = TelegramClient(StringSession(cleaned), self.api_id, self.api_hash)
-            await self.client.start()
+            await self.client.connect()
+            if not await self.client.is_user_authorized():
+                logger.error("VC_DEBUG: SESSION_STRING unauthorized / invalid session.")
+                await self.client.disconnect()
+                self.client = None
+                return
+            me = await self.client.get_me()
             self.client.add_event_handler(self._on_raw_update, events.Raw)
-            logger.info("Assistant MTProto client connected.")
+            logger.info("VC_DEBUG: Assistant connected as id=%s username=@%s", me.id, me.username or "")
+            asyncio.create_task(self._scan_existing_calls())
         except Exception as exc:
-            logger.error("Assistant MTProto start failed (check SESSION_STRING): %s", exc)
+            logger.error("VC_DEBUG: Assistant start failed (check SESSION_STRING): %s", exc)
             self.client = None
+
+    async def _scan_existing_calls(self) -> None:
+        if not self.client or not self.client.is_connected():
+            return
+        try:
+            async for dialog in self.client.iter_dialogs(limit=50):
+                ent = dialog.entity
+                title = getattr(ent, "title", None) or str(dialog.id)
+                if isinstance(ent, Channel) and getattr(ent, "megagroup", False):
+                    chat_id = normalize_channel_chat_id(ent.id)
+                    try:
+                        full = await self.client(GetFullChannelRequest(ent))
+                        call = getattr(full.full_chat, "call", None)
+                        if isinstance(call, GroupCall):
+                            logger.info("VC_DEBUG: Found active VC in '%s' (%s), joining...", title, chat_id)
+                            await self.join_vc(chat_id, title, int(call.id), int(call.access_hash))
+                    except Exception:
+                        pass
+                elif isinstance(ent, Chat):
+                    chat_id = -abs(int(ent.id))
+                    try:
+                        full = await self.client(GetFullChatRequest(ent.id))
+                        call = getattr(full.full_chat, "call", None)
+                        if isinstance(call, GroupCall):
+                            logger.info("VC_DEBUG: Found active chat VC in '%s' (%s), joining...", title, chat_id)
+                            await self.join_vc(chat_id, title, int(call.id), int(call.access_hash))
+                    except Exception:
+                        pass
+        except Exception as exc:
+            logger.warning("VC_DEBUG: Dialog VC scan error: %s", exc)
 
     async def stop(self) -> None:
         for chat_id in list(self._active_joins.keys()):
@@ -596,12 +625,14 @@ class AssistantVCController:
 
     async def join_vc(self, chat_id: int, chat_title: str, call_id: int, access_hash: int) -> bool:
         if not self.client or not self.client.is_connected():
+            logger.warning("VC_DEBUG: Assistant client not connected; cannot join VC in %s", chat_id)
             return False
         if not await self.moderation.ensure_bot_is_admin(chat_id, chat_title):
-            logger.info("Main Bot is not admin in '%s' (%s); skipping VC join.", chat_title, chat_id)
+            logger.warning("VC_DEBUG: Main Bot is not admin in '%s' (%s); skipping VC join.", chat_title, chat_id)
             return False
         settings = await self.db.get_group_settings(chat_id)
         if not settings.get("auto_vc_join", 1):
+            logger.info("VC_DEBUG: auto_vc_join disabled in '%s' (%s).", chat_title, chat_id)
             return False
 
         lock = self._join_locks.setdefault(chat_id, asyncio.Lock())
@@ -625,11 +656,11 @@ class AssistantVCController:
                         )
                     )
                     self._active_joins[chat_id] = call_id
-                    logger.info("Assistant silently joined VC in '%s' (%s) on attempt %d.", chat_title, chat_id, attempt)
+                    logger.info("VC_DEBUG: Assistant silently joined VC in '%s' (%s) on attempt %d.", chat_title, chat_id, attempt)
                     return True
                 except (RPCError, Exception) as exc:
                     last_err = str(exc)
-                    logger.warning("VC join attempt %d/%d failed in '%s': %s", attempt, self.max_retries, chat_title, last_err)
+                    logger.warning("VC_DEBUG: VC join attempt %d/%d failed in '%s': %s", attempt, self.max_retries, chat_title, last_err)
                     if attempt < self.max_retries:
                         await asyncio.sleep(self.retry_delay)
 
@@ -650,9 +681,9 @@ class AssistantVCController:
         try:
             if self.client and self.client.is_connected():
                 await self.client(LeaveGroupCallRequest(call=InputGroupCall(id=active_id, access_hash=0), source=0))
-            logger.info("Assistant left VC in '%s' (%s).", chat_title, chat_id)
+            logger.info("VC_DEBUG: Assistant left VC in '%s' (%s).", chat_title, chat_id)
         except RPCError as exc:
-            logger.warning("Leave VC error in %s: %s", chat_id, exc)
+            logger.warning("VC_DEBUG: Leave VC error in %s: %s", chat_id, exc)
         finally:
             self._active_joins.pop(chat_id, None)
             self._known_calls.pop(active_id, None)
@@ -664,7 +695,8 @@ class AssistantVCController:
         chat_id: Optional[int] = None
 
         if raw_id:
-            chat_id = normalize_channel_chat_id(int(raw_id)) if int(raw_id) > 0 else int(raw_id)
+            raw_int = int(raw_id)
+            chat_id = normalize_channel_chat_id(raw_int) if raw_int > 0 else raw_int
         else:
             call_obj = getattr(update, "call", None)
             call_id = getattr(call_obj, "id", None)
@@ -689,7 +721,11 @@ class AssistantVCController:
         return chat_id, str(chat_id)
 
     async def _on_raw_update(self, update: Any) -> None:
+        if not isinstance(update, (UpdateGroupCall, UpdateGroupCallParticipants)):
+            return
+
         chat_id, chat_title = await self._resolve_chat(update)
+        logger.info("VC_DEBUG: Event=%s chat_id=%s title='%s'", type(update).__name__, chat_id, chat_title)
         if chat_id is None:
             return
 
@@ -718,7 +754,7 @@ class AssistantVCController:
                 has_camera = bool(getattr(p, "camera", False))
                 paused = bool(getattr(p, "video_paused", False))
                 logger.info(
-                    "VC participant update in '%s' (%s): user=%s video=%s camera=%s paused=%s",
+                    "VC_DEBUG: Participant in '%s' (%s): user=%s video=%s camera=%s paused=%s",
                     chat_title, chat_id, user_id, has_video, has_camera, paused,
                 )
 
@@ -735,9 +771,6 @@ class AssistantVCController:
                         )
                         if muted:
                             self._muted_in_call[key] = True
-                          # ==============================================================================
-# 5. MAIN BOT + OWNER ADMIN PANEL + BROADCASTS
-# ==============================================================================
 def format_uptime(start_mono: float) -> str:
     sec = max(0, int(time.monotonic() - start_mono))
     d, rem = divmod(sec, 86400)
@@ -1012,4 +1045,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         sys.exit(0)
-                                       
+        
