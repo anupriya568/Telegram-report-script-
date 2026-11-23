@@ -270,6 +270,14 @@ async def monitor_video_chats():
         await asyncio.sleep(VC_POLL_INTERVAL)
 
 
+# ================= DEBUG LOGGER =================
+@bot.on_message(group=-1)
+async def debug_all_messages(client: Client, message: Message):
+    uid = message.from_user.id if message.from_user else None
+    cid = message.chat.id if message.chat else None
+    print(f"[BOT MSG] chat={cid} user={uid} text={message.text!r}")
+
+
 # ================= BOT COMMANDS & TEXT FILTER =================
 @bot.on_message(filters.new_chat_members)
 async def on_new_members(client: Client, message: Message):
@@ -484,6 +492,9 @@ async def main():
 
     await bot.start()
     await assistant.start()
+    me_bot = await bot.get_me()
+    me_ass = await assistant.get_me()
+    print(f"Bot started: @{me_bot.username} ({me_bot.id}) | Assistant: {me_ass.id}")
     asyncio.create_task(monitor_video_chats())
     print("Bot and Assistant are running...")
     await asyncio.Event().wait()
@@ -491,4 +502,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-        
+    
