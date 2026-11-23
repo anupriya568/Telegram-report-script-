@@ -153,7 +153,9 @@ def get_help_text() -> str:
         "• `/backup` — पूरी DB फ़ाइल बैकअप लें (Owner)\n"
         "• `/broadcast <मैसेज>` — सभी जुड़े ग्रुप्स/चैट्स में ब्रॉडकास्ट करें (Owner)"
     )
-    def register_handlers(bot: Client, assistant: Client) -> None:
+
+
+def register_handlers(bot: Client, assistant: Client) -> None:
     async def is_chat_admin(chat_id: int, user_id: int) -> bool:
         if user_id == OWNER_ID:
             return True
@@ -236,8 +238,7 @@ def get_help_text() -> str:
                     await reply_target.message.reply_text(err_text)
             else:
                 await reply_target.reply_text(err_text)
-
-    @bot.on_message(group=-1)
+                    @bot.on_message(group=-1)
     async def debug_msg(client: Client, message: Message):
         uid = message.from_user.id if message.from_user else None
         cid = message.chat.id if message.chat else None
@@ -554,4 +555,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-            
+    
