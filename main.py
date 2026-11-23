@@ -1,6 +1,13 @@
 import asyncio
 import json
 import os
+
+# Python 3.14+ में Pyrogram इम्पोर्ट करने से पहले event loop सेट करें
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait, RPCError
 from pyrogram.raw import functions, types
@@ -302,7 +309,6 @@ async def help_cmd(client: Client, message: Message):
 
 @bot.on_message(filters.command("backup") & filters.user(OWNER_ID))
 async def backup_cmd(client: Client, message: Message):
-    # सुनिश्चित करें कि कम से कम खाली/मौजूदा डेटा फ़ाइल तैयार हो
     load_data()
     try:
         await client.send_document(
@@ -485,3 +491,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+        
