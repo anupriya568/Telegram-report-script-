@@ -1,5 +1,5 @@
-python-telegram-bot>=21.0
-telethon>=1.36.0
-py-tgcalls>=3.0.0
+python-telegram-bot
+telethon
+py-tgcalls
 
 
