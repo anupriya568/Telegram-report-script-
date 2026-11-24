@@ -1,5 +1,8 @@
 import asyncio
 import logging
+import os
+import struct
+import wave
 from typing import Any, Dict, List, Optional, Set
 
 from pytgcalls import PyTgCalls
@@ -15,6 +18,20 @@ from database import Database, extract_invite_hash, normalize_channel_chat_id
 from moderation import ModerationEngine
 
 logger = logging.getLogger("modguard.vc")
+
+SILENT_WAV_PATH = "silent_vc.wav"
+
+
+def _ensure_silent_wav(path: str = SILENT_WAV_PATH, duration_sec: int = 1, sample_rate: int = 8000) -> str:
+    if os.path.exists(path) and os.path.getsize(path) > 44:
+        return path
+    num_samples = sample_rate * duration_sec
+    with wave.open(path, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(struct.pack("<" + "h" * num_samples, *([0] * num_samples)))
+    return path
 
 
 class AssistantVCController:
@@ -69,6 +86,7 @@ class AssistantVCController:
             logger.warning("VC_DEBUG: SESSION_STRING empty; Assistant VC monitor disabled.")
             return
         try:
+            _ensure_silent_wav(SILENT_WAV_PATH)
             self.client = TelegramClient(StringSession(cleaned), self.api_id, self.api_hash)
             await self.client.connect()
             if not await self.client.is_user_authorized():
@@ -261,6 +279,7 @@ class AssistantVCController:
 
             self._known_calls[call_id] = chat_id
             self._chat_titles[chat_id] = chat_title
+            wav_file = _ensure_silent_wav(SILENT_WAV_PATH)
             last_err = ""
 
             for attempt in range(1, self.max_retries + 1):
@@ -268,8 +287,7 @@ class AssistantVCController:
                     await self.calls.play(
                         chat_id,
                         MediaStream(
-                            media_path=None,
-                            audio_parameters=None,
+                            wav_file,
                             video_parameters=None,
                         ),
                     )
@@ -356,4 +374,4 @@ class AssistantVCController:
             await self.leave_vc(chat_id, title, reason="BOT_SHUTDOWN", force=True)
         if self.client and self.client.is_connected():
             await self.client.disconnect()
-            
+    
