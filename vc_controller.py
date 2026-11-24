@@ -1,6 +1,7 @@
 import asyncio
 import logging
-from typing import Any, Dict, List, Optional, Set
+import time
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from pytgcalls import PyTgCalls
 from pytgcalls.types import ChatUpdate, MediaStream, UpdatedGroupCallParticipants
@@ -149,7 +150,8 @@ class AssistantVCController:
                 exc,
             )
             return False
-            async def _poll_active_calls_loop(self) -> None:
+
+    async def _poll_active_calls_loop(self) -> None:
         while self._running:
             try:
                 await asyncio.sleep(6)
@@ -205,6 +207,7 @@ class AssistantVCController:
                         await self.join_vc(chat_id, title, cid, 0)
                         await asyncio.sleep(0.5)
                 elif chat_id in self._active_joins:
+                    # Call no longer exists on chat -> admin ended VC
                     await self.leave_vc(chat_id, title, reason="VC_ENDED_BY_ADMIN", force=True)
         except Exception as exc:
             logger.warning("VC_DEBUG: Dialog sync error: %s", exc)
@@ -262,6 +265,7 @@ class AssistantVCController:
 
             for attempt in range(1, self.max_retries + 1):
                 try:
+                    # Join call silently with no outgoing audio/video stream so assistant stays in VC until VC ends
                     await self.calls.play(
                         chat_id,
                         MediaStream(
@@ -353,4 +357,4 @@ class AssistantVCController:
             await self.leave_vc(chat_id, title, reason="BOT_SHUTDOWN", force=True)
         if self.client and self.client.is_connected():
             await self.client.disconnect()
-                
+                        
