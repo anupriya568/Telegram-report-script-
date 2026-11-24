@@ -233,15 +233,17 @@ class AssistantVCController:
                     assistant_present = True
                 await self._evaluate_participant(chat_id, chat_title, p)
 
+            # Silent media-less joins may not always appear in participant list;
+            # only attempt a gentle rejoin after a longer cooldown (180s) if already marked joined.
             now = time.monotonic()
             last_rejoin = self._rejoin_cooldown.get(chat_id, 0.0)
-            if not assistant_present and self._active_joins.get(chat_id) == call_id and (now - last_rejoin) > 45.0:
+            if not assistant_present and self._active_joins.get(chat_id) == call_id and (now - last_rejoin) > 180.0:
                 self._rejoin_cooldown[chat_id] = now
-                logger.warning(
-                    "VC_DEBUG: Assistant was absent from call_id=%s in '%s' (%s); re-joining call.",
-                    call_id,
+                logger.debug(
+                    "VC_DEBUG: Refreshing silent VC session in '%s' (%s) call_id=%s",
                     chat_title,
                     chat_id,
+                    call_id,
                 )
                 self._active_joins.pop(chat_id, None)
                 await self.join_vc(chat_id, chat_title, call_id, access_hash)
