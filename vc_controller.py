@@ -286,10 +286,7 @@ class AssistantVCController:
                 try:
                     await self.calls.play(
                         chat_id,
-                        MediaStream(
-                            wav_file,
-                            video_parameters=None,
-                        ),
+                        MediaStream(wav_file),
                     )
                     self._active_joins[chat_id] = call_id
                     logger.info(
