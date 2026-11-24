@@ -1,10 +1,9 @@
 import asyncio
 import logging
-import time
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set
 
 from pytgcalls import PyTgCalls
-from pytgcalls.types import ChatUpdate, MediaStream, UpdatedGroupCallParticipants
+from pytgcalls.types import ChatUpdate, MediaStream
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError, RPCError, UserAlreadyParticipantError
 from telethon.sessions import StringSession
@@ -100,24 +99,26 @@ class AssistantVCController:
         @self.calls.on_update()
         async def _on_call_update(_: PyTgCalls, update: Any) -> None:
             if isinstance(update, ChatUpdate):
-                chat_id = normalize_channel_chat_id(int(update.chat_id)) if int(update.chat_id) > 0 else int(update.chat_id)
-                title = self._chat_titles.get(chat_id, str(chat_id))
-                status_str = str(getattr(update, "status", "")).upper()
-                if "CLOSED_VOICE_CHAT" in status_str or "DISCARDED" in status_str or "LEFT" in status_str:
-                    await self.leave_vc(chat_id, title, reason=f"CHAT_UPDATE_{status_str}", force=True)
-                elif "CREATED_VOICE_CHAT" in status_str or "ACTIVE" in status_str:
-                    await self._sync_dialogs_and_calls(auto_join=True)
-
-            elif isinstance(update, UpdatedGroupCallParticipants):
                 raw_cid = int(getattr(update, "chat_id", 0) or 0)
-                if not raw_cid:
-                    return
+                if raw_cid:
+                    chat_id = normalize_channel_chat_id(raw_cid) if raw_cid > 0 else raw_cid
+                    title = self._chat_titles.get(chat_id, str(chat_id))
+                    status_str = str(getattr(update, "status", "")).upper()
+                    if "CLOSED_VOICE_CHAT" in status_str or "DISCARDED" in status_str or "LEFT" in status_str:
+                        await self.leave_vc(chat_id, title, reason=f"CHAT_UPDATE_{status_str}", force=True)
+                    elif "CREATED_VOICE_CHAT" in status_str or "ACTIVE" in status_str:
+                        await self._sync_dialogs_and_calls(auto_join=True)
+                return
+
+            participants = getattr(update, "participants", None)
+            raw_cid = int(getattr(update, "chat_id", 0) or 0)
+            if participants and raw_cid:
                 chat_id = normalize_channel_chat_id(raw_cid) if raw_cid > 0 else raw_cid
                 title = self._chat_titles.get(chat_id, str(chat_id))
                 settings = await self.db.get_group_settings(chat_id)
                 if not settings.get("auto_camera_mute", 1):
                     return
-                for p in getattr(update, "participants", []) or []:
+                for p in participants:
                     await self._evaluate_participant_obj(chat_id, title, p)
 
     async def join_group_via_invite(self, invite_link: str, chat_id: int, chat_title: str) -> bool:
@@ -207,7 +208,6 @@ class AssistantVCController:
                         await self.join_vc(chat_id, title, cid, 0)
                         await asyncio.sleep(0.5)
                 elif chat_id in self._active_joins:
-                    # Call no longer exists on chat -> admin ended VC
                     await self.leave_vc(chat_id, title, reason="VC_ENDED_BY_ADMIN", force=True)
         except Exception as exc:
             logger.warning("VC_DEBUG: Dialog sync error: %s", exc)
@@ -265,7 +265,6 @@ class AssistantVCController:
 
             for attempt in range(1, self.max_retries + 1):
                 try:
-                    # Join call silently with no outgoing audio/video stream so assistant stays in VC until VC ends
                     await self.calls.play(
                         chat_id,
                         MediaStream(
@@ -357,4 +356,4 @@ class AssistantVCController:
             await self.leave_vc(chat_id, title, reason="BOT_SHUTDOWN", force=True)
         if self.client and self.client.is_connected():
             await self.client.disconnect()
-                        
+            
