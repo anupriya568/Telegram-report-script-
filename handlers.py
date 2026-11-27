@@ -333,7 +333,8 @@ def register_handlers(
         if not raw_word:
             await update.message.reply_text("Usage: <code>/addword &lt;word&gt;</code>", parse_mode="HTML")
             return
-        await db.upsert_group(chat.id, chat.title or str(chat.id), await moderation.is_bot_admin(chat.id))
+        is_adm = await moderation.ensure_bot_is_admin(chat.id, chat.title or str(chat.id))
+        await db.upsert_group(chat.id, chat.title or str(chat.id), is_adm)
         added = await db.add_bad_word(chat.id, raw_word, added_by=user.id if user else None)
         if added:
             await update.message.reply_text(
@@ -453,7 +454,6 @@ def register_handlers(
                     )
                 except TelegramError:
                     pass
-                # Non-blocking yield so other groups, broadcasts, and commands never stall
                 await asyncio.sleep(1.5)
         finally:
             active_tag_tasks.pop(chat_id, None)
@@ -617,4 +617,4 @@ def register_handlers(
     app.add_handler(CommandHandler("logs", cmd_logs))
     app.add_handler(CommandHandler("alerts", cmd_alerts))
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
-    app.add_error_handler(on_error)
+    app.add_error_handler(on_error)                
