@@ -327,7 +327,6 @@ def register_handlers(
         if not chat or chat.type not in ("group", "supergroup") or not update.message:
             return
         if not await is_group_owner_or_admin(chat.id, user.id if user else None):
-            await update.message.reply_text("❌ Sirf group owner ya admin word add kar sakte hain.")
             return
         raw_word = " ".join(context.args or []).strip()
         if not raw_word:
@@ -353,7 +352,6 @@ def register_handlers(
         if not chat or chat.type not in ("group", "supergroup") or not update.message:
             return
         if not await is_group_owner_or_admin(chat.id, user.id if user else None):
-            await update.message.reply_text("❌ Sirf group owner ya admin word remove kar sakte hain.")
             return
         raw_word = " ".join(context.args or []).strip()
         if not raw_word:
@@ -374,7 +372,6 @@ def register_handlers(
         if not chat or chat.type not in ("group", "supergroup") or not update.message:
             return
         if not await is_group_owner_or_admin(chat.id, user.id if user else None):
-            await update.message.reply_text("❌ Sirf group owner ya admin word list dekh sakte hain.")
             return
         words = await db.get_bad_words(chat.id)
         if not words:
@@ -392,7 +389,6 @@ def register_handlers(
         if not chat or chat.type not in ("group", "supergroup") or not update.message:
             return
         if not await is_group_owner_or_admin(chat.id, user.id if user else None):
-            await update.message.reply_text("❌ Sirf group owner ya admin VC settings badal sakte hain.")
             return
 
         key_map = {
@@ -464,7 +460,6 @@ def register_handlers(
         if not chat or chat.type not in ("group", "supergroup") or not update.message:
             return
         if not await is_group_owner_or_admin(chat.id, user.id if user else None):
-            await update.message.reply_text("❌ Sirf group owner ya admin /tagall use kar sakte hain.")
             return
 
         existing = active_tag_tasks.get(chat.id)
@@ -617,4 +612,4 @@ def register_handlers(
     app.add_handler(CommandHandler("logs", cmd_logs))
     app.add_handler(CommandHandler("alerts", cmd_alerts))
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
-    app.add_error_handler(on_error)                
+    app.add_error_handler(on_error)
