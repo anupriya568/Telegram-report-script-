@@ -20,8 +20,6 @@ from telethon.tl.types import (
     GroupCall,
     GroupCallDiscarded,
     InputGroupCall,
-    InputPeerChannel,
-    InputPeerChat,
     InputPeerUser,
     UpdateGroupCall,
     UpdateGroupCallParticipants,
@@ -48,7 +46,7 @@ def _ensure_silent_wav(path: str = SILENT_WAV_PATH, duration_sec: int = 1, sampl
 
 
 def _transcribe_wav_sync(wav_path: str) -> str:
-    """Best-effort local speech-to-text if an STT package is available in the environment."""
+    """Best-effort speech-to-text if speech_recognition is installed."""
     try:
         import speech_recognition as sr  # type: ignore
 
@@ -58,6 +56,20 @@ def _transcribe_wav_sync(wav_path: str) -> str:
         return str(recognizer.recognize_google(audio_data) or "").lower()
     except Exception:
         return ""
+
+
+def _is_media_stream_active(media_obj: Any, flag_attr: Any = None, paused_flag: bool = False, stopped_flag: bool = False) -> bool:
+    if paused_flag or stopped_flag:
+        return False
+    if flag_attr is True:
+        return True
+    if media_obj is None or media_obj is False:
+        return False
+    if isinstance(media_obj, bool):
+        return media_obj
+    if getattr(media_obj, "paused", False) or getattr(media_obj, "stopped", False):
+        return False
+    return True
 
 
 class AssistantVCController:
@@ -135,35 +147,46 @@ class AssistantVCController:
         except Exception:
             return True
 
-    async def mute_participant_in_vc(self, chat_id: int, chat_title: str, user_id: int, reason: str) -> None:
-        if not self.client or not self.client.is_connected():
-            return
-        call_id = self._known_calls.get(chat_id) or self._active_joins.get(chat_id)
-        access_hash = self._call_access_hashes.get(call_id or 0, 0)
-        if not call_id:
-            return
-
+    async def mute_or_enforce_in_vc(self, chat_id: int, chat_title: str, user_id: int, reason: str) -> None:
         now_ts = asyncio.get_running_loop().time()
         key = (chat_id, user_id)
-        if now_ts - self._muted_cooldown.get(key, 0.0) < 4.0:
+        if now_ts - self._muted_cooldown.get(key, 0.0) < 3.0:
             return
         self._muted_cooldown[key] = now_ts
 
-        try:
-            user_entity = await self.client.get_entity(user_id)
-            input_user = InputPeerUser(user_id=user_id, access_hash=int(getattr(user_entity, "access_hash", 0) or 0))
-            await self.client(
-                EditGroupCallParticipantRequest(
-                    call=InputGroupCall(id=int(call_id), access_hash=int(access_hash)),
-                    participant=input_user,
-                    muted=True,
-                    video_stopped=True,
+        muted_ok = False
+        call_id = self._known_calls.get(chat_id) or self._active_joins.get(chat_id)
+        access_hash = self._call_access_hashes.get(call_id or 0, 0)
+
+        if self.client and self.client.is_connected() and call_id:
+            try:
+                user_entity = await self.client.get_entity(user_id)
+                input_user = InputPeerUser(
+                    user_id=user_id,
+                    access_hash=int(getattr(user_entity, "access_hash", 0) or 0),
                 )
+                await self.client(
+                    EditGroupCallParticipantRequest(
+                        call=InputGroupCall(id=int(call_id), access_hash=int(access_hash)),
+                        participant=input_user,
+                        muted=True,
+                        video_stopped=True,
+                    )
+                )
+                muted_ok = True
+                logger.info("VC_DEBUG: Muted user=%s in VC '%s' (%s) | reason=%s", user_id, chat_title, chat_id, reason)
+                await self.db.add_moderation_log(chat_id, chat_title, user_id, None, "VC_MUTE", reason)
+            except Exception as exc:
+                logger.warning("VC_DEBUG: EditGroupCallParticipantRequest failed for user=%s in '%s': %s", user_id, chat_title, exc)
+
+        if not muted_ok:
+            await self.moderation.ensure_bot_is_admin(chat_id, chat_title)
+            await self.moderation.remove_user_from_group(
+                chat_id=chat_id,
+                chat_title=chat_title,
+                user_id=user_id,
+                reason=f"{reason} (fallback remove)",
             )
-            logger.info("VC_DEBUG: Muted user=%s in VC '%s' (%s) | reason=%s", user_id, chat_title, chat_id, reason)
-            await self.db.add_moderation_log(chat_id, chat_title, user_id, None, "VC_MUTE", reason)
-        except Exception as exc:
-            logger.debug("VC_DEBUG: Mute failed for user=%s in '%s': %s", user_id, chat_title, exc)
 
     async def check_spoken_text_for_abuse(self, chat_id: int, chat_title: str, user_id: int, spoken_text: str) -> None:
         if not spoken_text:
@@ -179,7 +202,7 @@ class AssistantVCController:
         norm_text = " ".join(spoken_text.lower().split())
         for w in words:
             if w and w in norm_text:
-                await self.mute_participant_in_vc(
+                await self.mute_or_enforce_in_vc(
                     chat_id=chat_id,
                     chat_title=chat_title,
                     user_id=user_id,
@@ -317,7 +340,7 @@ class AssistantVCController:
     async def _poll_active_calls_loop(self) -> None:
         while self._running:
             try:
-                await asyncio.sleep(6)
+                await asyncio.sleep(3)
                 if not self.client or not self.client.is_connected() or not self.calls:
                     continue
                 await self._sync_dialogs_and_calls(auto_join=True)
@@ -331,7 +354,7 @@ class AssistantVCController:
                         ahash = self._call_access_hashes.get(cid_call, 0)
                         title = self._chat_titles.get(cid_chat, str(cid_chat))
                         await self._inspect_call_participants(cid_chat, title, cid_call, ahash)
-                        await asyncio.sleep(0.25)
+                        await asyncio.sleep(0.15)
 
                 await asyncio.gather(*(_check_one(c_id, call_id) for c_id, call_id in active_items))
             except asyncio.CancelledError:
@@ -428,7 +451,7 @@ class AssistantVCController:
         # 1. Non-group member in VC -> mute
         if settings.get("mute_non_members", 1):
             if not await self._is_group_member(chat_id, user_id):
-                await self.mute_participant_in_vc(
+                await self.mute_or_enforce_in_vc(
                     chat_id=chat_id,
                     chat_title=chat_title,
                     user_id=user_id,
@@ -439,18 +462,23 @@ class AssistantVCController:
         video_attr = getattr(p, "video", None)
         camera_attr = getattr(p, "camera", None)
         is_video_on_attr = getattr(p, "is_video_on", None)
-        screen_attr = getattr(p, "presentation", None) or getattr(p, "screen_sharing", None) or getattr(p, "is_screen_on", None)
         video_paused = bool(getattr(p, "video_paused", False) or getattr(p, "is_video_paused", False))
         video_stopped = bool(getattr(p, "video_stopped", False) or getattr(p, "is_video_stopped", False))
 
-        has_video_obj = video_attr is not None and not isinstance(video_attr, bool)
-        has_video_bool = video_attr is True or is_video_on_attr is True
-        has_camera = bool(camera_attr)
-        has_screen = bool(screen_attr)
+        screen_attr = (
+            getattr(p, "presentation", None)
+            or getattr(p, "screen_sharing", None)
+            or getattr(p, "is_screen_on", None)
+        )
+        screen_paused = bool(getattr(p, "presentation_paused", False) or getattr(p, "screen_paused", False))
+        screen_stopped = bool(getattr(p, "presentation_stopped", False) or getattr(p, "screen_stopped", False))
 
         # 2. Screen sharing -> mute
-        if settings.get("mute_on_screen_share", 1) and has_screen and not video_stopped:
-            await self.mute_participant_in_vc(
+        if settings.get("mute_on_screen_share", 1) and _is_media_stream_active(
+            screen_attr, flag_attr=screen_attr, paused_flag=screen_paused, stopped_flag=screen_stopped
+        ):
+            logger.info("VC_DEBUG: Screen share active for user=%s in '%s'", user_id, chat_title)
+            await self.mute_or_enforce_in_vc(
                 chat_id=chat_id,
                 chat_title=chat_title,
                 user_id=user_id,
@@ -459,9 +487,12 @@ class AssistantVCController:
             return
 
         # 3. Camera ON -> mute
-        is_video_active = (has_video_obj or has_video_bool or has_camera) and (not video_paused) and (not video_stopped)
-        if settings.get("mute_on_camera", 1) and is_video_active:
-            await self.mute_participant_in_vc(
+        camera_active = _is_media_stream_active(
+            video_attr, flag_attr=is_video_on_attr or camera_attr, paused_flag=video_paused, stopped_flag=video_stopped
+        )
+        if settings.get("mute_on_camera", 1) and camera_active:
+            logger.info("VC_DEBUG: Camera active for user=%s in '%s'", user_id, chat_title)
+            await self.mute_or_enforce_in_vc(
                 chat_id=chat_id,
                 chat_title=chat_title,
                 user_id=user_id,
@@ -640,3 +671,4 @@ class AssistantVCController:
             await self.leave_vc(chat_id, title, reason="BOT_SHUTDOWN", force=True)
         if self.client and self.client.is_connected():
             await self.client.disconnect()
+     
