@@ -7,16 +7,18 @@ from typing import Any, Dict, List, Optional
 DEFAULT_INTRO_TEXT: str = (
     "🛡️ <b>MODGUARD — Group & VC Guard</b>\n\n"
     "Aapke group aur Voice Chat ko surakshit rakhne ke liye moderation assistant.\n\n"
-    "• <b>VC Camera Protection:</b> VC mein non-admin ka camera on hote hi group se remove.\n"
+    "• <b>VC Protection:</b> VC mein camera, screen share, non-member join, ya abusive audio par turant mute.\n"
     "• <b>Admin Safe:</b> Group admins aur creator par koi pabandi nahi.\n\n"
     "Neeche diye gaye button se bot ko apne group mein jodein ya <b>Features</b> aur <b>How to Use</b> dekhein."
 )
 
 DEFAULT_FEATURES_TEXT: str = (
     "🛡️ <b>MODGUARD Features</b>\n\n"
-    "• <b>VC Camera Auto-Remove:</b> Non-admin user VC mein camera on kare toh turant group se remove.\n"
-    "• <b>Admin & Creator Safe:</b> Group admins aur creator par koi rule apply nahi hota.\n"
-    "• <b>Multi-VC Assistant:</b> VC start hote hi assistant join karta hai aur call khatam hone tak bana rehta hai."
+    "• <b>Abusive Language Mute:</b> VC mein non-admin gaali de toh detect karke assistant turant mute karega.\n"
+    "• <b>Camera & Screen Share Mute:</b> Non-admin camera ya screen share on kare toh VC mein mute.\n"
+    "• <b>Non-Member VC Mute:</b> Group ka member na ho aur VC mein aaye toh turant mute.\n"
+    "• <b>Custom Word List:</b> Group owner khud se words/gaali add, remove aur list kar sakta hai.\n"
+    "• <b>GC Tagging:</b> Group chat mein users ko smoothly tag karne ki suvidha."
 )
 
 DEFAULT_HOW_TO_USE_TEXT: str = (
@@ -60,6 +62,7 @@ class Database:
             self._conn.execute("PRAGMA journal_mode=WAL;")
             self._conn.execute("PRAGMA foreign_keys=ON;")
             self._create_tables()
+            self._migrate_tables()
             self._seed_defaults()
             self._conn.commit()
 
@@ -104,6 +107,20 @@ class Database:
                 chat_id INTEGER PRIMARY KEY,
                 auto_camera_mute INTEGER NOT NULL DEFAULT 1,
                 auto_vc_join INTEGER NOT NULL DEFAULT 1,
+                mute_on_camera INTEGER NOT NULL DEFAULT 1,
+                mute_on_screen_share INTEGER NOT NULL DEFAULT 1,
+                mute_non_members INTEGER NOT NULL DEFAULT 1,
+                mute_on_abuse INTEGER NOT NULL DEFAULT 1,
+                FOREIGN KEY (chat_id) REFERENCES groups_info(chat_id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS group_bad_words (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                word TEXT NOT NULL,
+                added_by INTEGER,
+                created_at TEXT NOT NULL,
+                UNIQUE(chat_id, word),
                 FOREIGN KEY (chat_id) REFERENCES groups_info(chat_id) ON DELETE CASCADE
             );
 
@@ -140,6 +157,22 @@ class Database:
             );
             """
         )
+
+    def _migrate_tables(self) -> None:
+        assert self._conn is not None
+        cols = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(group_settings)").fetchall()
+        }
+        migrations = {
+            "mute_on_camera": "ALTER TABLE group_settings ADD COLUMN mute_on_camera INTEGER NOT NULL DEFAULT 1;",
+            "mute_on_screen_share": "ALTER TABLE group_settings ADD COLUMN mute_on_screen_share INTEGER NOT NULL DEFAULT 1;",
+            "mute_non_members": "ALTER TABLE group_settings ADD COLUMN mute_non_members INTEGER NOT NULL DEFAULT 1;",
+            "mute_on_abuse": "ALTER TABLE group_settings ADD COLUMN mute_on_abuse INTEGER NOT NULL DEFAULT 1;",
+        }
+        for col, sql in migrations.items():
+            if col not in cols:
+                self._conn.execute(sql)
 
     def _seed_defaults(self) -> None:
         assert self._conn is not None
@@ -338,8 +371,76 @@ class Database:
                     "chat_id": chat_id,
                     "auto_camera_mute": 1,
                     "auto_vc_join": 1,
+                    "mute_on_camera": 1,
+                    "mute_on_screen_share": 1,
+                    "mute_non_members": 1,
+                    "mute_on_abuse": 1,
                 }
             )
+
+        return await self._run(_op)
+
+    async def set_group_setting(self, chat_id: int, key: str, enabled: bool) -> None:
+        allowed_keys = {
+            "auto_camera_mute",
+            "auto_vc_join",
+            "mute_on_camera",
+            "mute_on_screen_share",
+            "mute_non_members",
+            "mute_on_abuse",
+        }
+        if key not in allowed_keys:
+            raise ValueError(f"Invalid setting key: {key}")
+
+        def _op(conn: sqlite3.Connection):
+            conn.execute("INSERT OR IGNORE INTO group_settings (chat_id) VALUES (?)", (chat_id,))
+            conn.execute(
+                f"UPDATE group_settings SET {key} = ? WHERE chat_id = ?",
+                (1 if enabled else 0, chat_id),
+            )
+
+        await self._run(_op)
+
+    async def add_bad_word(self, chat_id: int, word: str, added_by: Optional[int] = None) -> bool:
+        cleaned = " ".join((word or "").strip().lower().split())
+        if not cleaned:
+            raise ValueError("Word cannot be empty.")
+
+        def _op(conn: sqlite3.Connection):
+            conn.execute("INSERT OR IGNORE INTO groups_info (chat_id, title, is_bot_admin, active, updated_at) VALUES (?, ?, 0, 1, ?)",
+                         (chat_id, str(chat_id), utc_now_iso()))
+            cur = conn.execute(
+                """
+                INSERT OR IGNORE INTO group_bad_words (chat_id, word, added_by, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (chat_id, cleaned, added_by, utc_now_iso()),
+            )
+            return cur.rowcount > 0
+
+        return await self._run(_op)
+
+    async def remove_bad_word(self, chat_id: int, word: str) -> bool:
+        cleaned = " ".join((word or "").strip().lower().split())
+        if not cleaned:
+            return False
+
+        def _op(conn: sqlite3.Connection):
+            cur = conn.execute(
+                "DELETE FROM group_bad_words WHERE chat_id = ? AND word = ?",
+                (chat_id, cleaned),
+            )
+            return cur.rowcount > 0
+
+        return await self._run(_op)
+
+    async def get_bad_words(self, chat_id: int) -> List[str]:
+        def _op(conn: sqlite3.Connection):
+            rows = conn.execute(
+                "SELECT word FROM group_bad_words WHERE chat_id = ? ORDER BY word ASC",
+                (chat_id,),
+            ).fetchall()
+            return [str(r["word"]) for r in rows]
 
         return await self._run(_op)
 
@@ -440,3 +541,4 @@ class Database:
             )
 
         await self._run(_op)
+   
