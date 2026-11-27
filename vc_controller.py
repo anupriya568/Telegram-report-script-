@@ -53,7 +53,14 @@ def _transcribe_wav_sync(wav_path: str) -> str:
         recognizer = sr.Recognizer()
         with sr.AudioFile(wav_path) as source:
             audio_data = recognizer.record(source)
-        return str(recognizer.recognize_google(audio_data) or "").lower()
+        for lang in ("en-US", "hi-IN"):
+            try:
+                text = str(recognizer.recognize_google(audio_data, language=lang) or "").strip().lower()
+                if text:
+                    return text
+            except Exception:
+                continue
+        return ""
     except Exception:
         return ""
 
@@ -105,6 +112,8 @@ class AssistantVCController:
         self._group_members_cache: Dict[int, Set[int]] = {}
         self._admin_cache: Dict[Tuple[int, int], Tuple[bool, float]] = {}
         self._settings_cache: Dict[int, Tuple[Dict[str, Any], float]] = {}
+        self._last_speaker: Dict[int, Tuple[int, float]] = {}
+        self._audio_buffers: Dict[Tuple[int, int], bytearray] = {}
         self._action_cooldown: Dict[Tuple[int, int], float] = {}
         self._join_locks: Dict[int, asyncio.Lock] = {}
         self._poll_sem = asyncio.Semaphore(5)
@@ -183,10 +192,12 @@ class AssistantVCController:
             reason=reason,
         )
 
-    async def mute_or_enforce_in_vc(self, chat_id: int, chat_title: str, user_id: int, reason: str) -> None:
+    async def mute_user_in_vc(self, chat_id: int, chat_title: str, user_id: int, reason: str) -> None:
+        if await self._is_admin_fast(chat_id, user_id):
+            return
         now_ts = time.monotonic()
         key = (chat_id, user_id)
-        if now_ts - self._action_cooldown.get(key, 0.0) < 1.5:
+        if now_ts - self._action_cooldown.get(key, 0.0) < 2.0:
             return
         self._action_cooldown[key] = now_ts
 
@@ -209,10 +220,10 @@ class AssistantVCController:
                     )
                 )
                 logger.info("VC_DEBUG: Muted user=%s in VC '%s' (%s) | reason=%s", user_id, chat_title, chat_id, reason)
-                asyncio.create_task(self.db.add_moderation_log(chat_id, chat_title, user_id, None, "VC_MUTE", reason))
+                asyncio.create_task(self.db.add_moderation_log(chat_id, chat_title, user_id, None, "VC_ABUSE_MUTE", reason))
                 return
             except Exception as exc:
-                logger.debug("VC_DEBUG: Mute skipped for user=%s, removing: %s", user_id, exc)
+                logger.warning("VC_DEBUG: VC mute failed for user=%s in '%s': %s", user_id, chat_title, exc)
 
         await self.moderation.remove_user_from_group(
             chat_id=chat_id,
@@ -235,11 +246,11 @@ class AssistantVCController:
         norm_text = " ".join(spoken_text.lower().split())
         for w in words:
             if w and w in norm_text:
-                await self.mute_or_enforce_in_vc(
+                await self.mute_user_in_vc(
                     chat_id=chat_id,
                     chat_title=chat_title,
                     user_id=user_id,
-                    reason=f"Abusive word detected in VC: '{w}'",
+                    reason=f"Abusive word spoken in VC: '{w}'",
                 )
                 break
 
@@ -258,6 +269,16 @@ class AssistantVCController:
         if not words:
             return
 
+        buf = self._audio_buffers.setdefault((chat_id, user_id), bytearray())
+        buf.extend(pcm_bytes)
+        # Process ~2.5s of 16kHz 16-bit mono PCM (~80,000 bytes)
+        target_bytes = int(sample_rate * 2 * 2.5)
+        if len(buf) < target_bytes:
+            return
+
+        chunk = bytes(buf[:target_bytes])
+        del buf[:target_bytes]
+
         tmp_path = ""
         try:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
@@ -266,7 +287,7 @@ class AssistantVCController:
                 wf.setnchannels(1)
                 wf.setsampwidth(2)
                 wf.setframerate(sample_rate)
-                wf.writeframes(pcm_bytes)
+                wf.writeframes(chunk)
 
             loop = asyncio.get_running_loop()
             transcript = await loop.run_in_executor(None, _transcribe_wav_sync, tmp_path)
@@ -280,6 +301,37 @@ class AssistantVCController:
                     os.remove(tmp_path)
                 except Exception:
                     pass
+
+    def _attach_audio_frame_listener(self) -> None:
+        if not self.calls:
+            return
+        for hook_name in ("on_frames", "on_audio_frame"):
+            hook_fn = getattr(self.calls, hook_name, None)
+            if callable(hook_fn):
+                try:
+                    @hook_fn()
+                    async def _on_frames(_: Any, frames: Any = None) -> None:
+                        if not frames:
+                            return
+                        items = frames if isinstance(frames, (list, tuple)) else [frames]
+                        for fr in items:
+                            raw_cid = int(getattr(fr, "chat_id", 0) or 0)
+                            if not raw_cid:
+                                continue
+                            chat_id = normalize_channel_chat_id(raw_cid) if raw_cid > 0 else raw_cid
+                            uid = int(getattr(fr, "user_id", 0) or getattr(fr, "ssrc", 0) or 0)
+                            if not uid:
+                                speaker_info = self._last_speaker.get(chat_id)
+                                if speaker_info and (time.monotonic() - speaker_info[1]) < 4.0:
+                                    uid = speaker_info[0]
+                            pcm = getattr(fr, "pcm", None) or getattr(fr, "data", None) or getattr(fr, "frame", None)
+                            sr_val = int(getattr(fr, "sample_rate", 16000) or 16000)
+                            if uid and isinstance(pcm, (bytes, bytearray)) and pcm:
+                                self._spawn_bg(self.handle_audio_chunk_for_user(chat_id, uid, bytes(pcm), sr_val))
+                    logger.info("VC_DEBUG: Attached incoming audio hook via %s", hook_name)
+                    return
+                except Exception as exc:
+                    logger.debug("VC_DEBUG: Hook %s attach skipped: %s", hook_name, exc)
 
     async def start(self) -> None:
         cleaned = (self.session_string or "").strip()
@@ -301,6 +353,7 @@ class AssistantVCController:
 
             self.calls = PyTgCalls(self.client)
             self._register_call_handlers()
+            self._attach_audio_frame_listener()
             await self.calls.start()
 
             self.client.add_event_handler(self._on_raw_update, events.Raw)
@@ -471,6 +524,9 @@ class AssistantVCController:
         user_id = int(uid)
         self._seen_group_users.setdefault(chat_id, set()).add(user_id)
 
+        if not getattr(p, "muted", False) and not getattr(p, "left", False):
+            self._last_speaker[chat_id] = (user_id, time.monotonic())
+
         if getattr(p, "left", False):
             return
 
@@ -481,7 +537,7 @@ class AssistantVCController:
 
         if settings.get("mute_non_members", 1):
             if not await self._is_group_member(chat_id, user_id):
-                await self.mute_or_enforce_in_vc(
+                await self.mute_user_in_vc(
                     chat_id=chat_id,
                     chat_title=chat_title,
                     user_id=user_id,
@@ -503,7 +559,6 @@ class AssistantVCController:
         screen_paused = bool(getattr(p, "presentation_paused", False) or getattr(p, "screen_paused", False))
         screen_stopped = bool(getattr(p, "presentation_stopped", False) or getattr(p, "screen_stopped", False))
 
-        # Screen sharing -> immediate group remove
         if settings.get("mute_on_screen_share", 1) and _is_media_stream_active(
             screen_attr, flag_attr=screen_attr, paused_flag=screen_paused, stopped_flag=screen_stopped
         ):
@@ -515,7 +570,6 @@ class AssistantVCController:
             )
             return
 
-        # Camera ON -> immediate group remove
         camera_active = _is_media_stream_active(
             video_attr, flag_attr=is_video_on_attr or camera_attr, paused_flag=video_paused, stopped_flag=video_stopped
         )
@@ -698,4 +752,4 @@ class AssistantVCController:
             title = self._chat_titles.get(chat_id, str(chat_id))
             await self.leave_vc(chat_id, title, reason="BOT_SHUTDOWN", force=True)
         if self.client and self.client.is_connected():
-            await self.client.disconnect()
+            await self.client.disconnect() 
