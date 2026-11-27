@@ -3,6 +3,7 @@ import logging
 import os
 import struct
 import tempfile
+import time
 import wave
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -46,7 +47,6 @@ def _ensure_silent_wav(path: str = SILENT_WAV_PATH, duration_sec: int = 1, sampl
 
 
 def _transcribe_wav_sync(wav_path: str) -> str:
-    """Best-effort speech-to-text if speech_recognition is installed."""
     try:
         import speech_recognition as sr  # type: ignore
 
@@ -103,7 +103,9 @@ class AssistantVCController:
         self._call_access_hashes: Dict[int, int] = {}
         self._seen_group_users: Dict[int, Set[int]] = {}
         self._group_members_cache: Dict[int, Set[int]] = {}
-        self._muted_cooldown: Dict[Tuple[int, int], float] = {}
+        self._admin_cache: Dict[Tuple[int, int], Tuple[bool, float]] = {}
+        self._settings_cache: Dict[int, Tuple[Dict[str, Any], float]] = {}
+        self._action_cooldown: Dict[Tuple[int, int], float] = {}
         self._join_locks: Dict[int, asyncio.Lock] = {}
         self._poll_sem = asyncio.Semaphore(5)
         self._poll_task: Optional[asyncio.Task] = None
@@ -114,6 +116,25 @@ class AssistantVCController:
         task = asyncio.create_task(coro)
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
+
+    async def _get_cached_settings(self, chat_id: int) -> Dict[str, Any]:
+        now = time.monotonic()
+        cached = self._settings_cache.get(chat_id)
+        if cached and (now - cached[1]) < 15.0:
+            return cached[0]
+        settings = await self.db.get_group_settings(chat_id)
+        self._settings_cache[chat_id] = (settings, now)
+        return settings
+
+    async def _is_admin_fast(self, chat_id: int, user_id: int) -> bool:
+        now = time.monotonic()
+        key = (chat_id, user_id)
+        cached = self._admin_cache.get(key)
+        if cached and (now - cached[1]) < 30.0:
+            return cached[0]
+        is_adm = await self.moderation.is_user_admin_or_creator(chat_id, user_id)
+        self._admin_cache[key] = (bool(is_adm), now)
+        return bool(is_adm)
 
     async def collect_group_participants(self, chat_id: int) -> List[int]:
         collected: Set[int] = set(self._seen_group_users.get(chat_id, set()))
@@ -147,14 +168,28 @@ class AssistantVCController:
         except Exception:
             return True
 
-    async def mute_or_enforce_in_vc(self, chat_id: int, chat_title: str, user_id: int, reason: str) -> None:
-        now_ts = asyncio.get_running_loop().time()
+    async def fast_remove_from_group(self, chat_id: int, chat_title: str, user_id: int, reason: str) -> None:
+        now_ts = time.monotonic()
         key = (chat_id, user_id)
-        if now_ts - self._muted_cooldown.get(key, 0.0) < 3.0:
+        if now_ts - self._action_cooldown.get(key, 0.0) < 1.5:
             return
-        self._muted_cooldown[key] = now_ts
+        self._action_cooldown[key] = now_ts
 
-        muted_ok = False
+        logger.info("VC_DEBUG: Instant remove user=%s in '%s' (%s) | reason=%s", user_id, chat_title, chat_id, reason)
+        await self.moderation.remove_user_from_group(
+            chat_id=chat_id,
+            chat_title=chat_title,
+            user_id=user_id,
+            reason=reason,
+        )
+
+    async def mute_or_enforce_in_vc(self, chat_id: int, chat_title: str, user_id: int, reason: str) -> None:
+        now_ts = time.monotonic()
+        key = (chat_id, user_id)
+        if now_ts - self._action_cooldown.get(key, 0.0) < 1.5:
+            return
+        self._action_cooldown[key] = now_ts
+
         call_id = self._known_calls.get(chat_id) or self._active_joins.get(chat_id)
         access_hash = self._call_access_hashes.get(call_id or 0, 0)
 
@@ -173,27 +208,25 @@ class AssistantVCController:
                         video_stopped=True,
                     )
                 )
-                muted_ok = True
                 logger.info("VC_DEBUG: Muted user=%s in VC '%s' (%s) | reason=%s", user_id, chat_title, chat_id, reason)
-                await self.db.add_moderation_log(chat_id, chat_title, user_id, None, "VC_MUTE", reason)
+                asyncio.create_task(self.db.add_moderation_log(chat_id, chat_title, user_id, None, "VC_MUTE", reason))
+                return
             except Exception as exc:
-                logger.warning("VC_DEBUG: EditGroupCallParticipantRequest failed for user=%s in '%s': %s", user_id, chat_title, exc)
+                logger.debug("VC_DEBUG: Mute skipped for user=%s, removing: %s", user_id, exc)
 
-        if not muted_ok:
-            await self.moderation.ensure_bot_is_admin(chat_id, chat_title)
-            await self.moderation.remove_user_from_group(
-                chat_id=chat_id,
-                chat_title=chat_title,
-                user_id=user_id,
-                reason=f"{reason} (fallback remove)",
-            )
+        await self.moderation.remove_user_from_group(
+            chat_id=chat_id,
+            chat_title=chat_title,
+            user_id=user_id,
+            reason=reason,
+        )
 
     async def check_spoken_text_for_abuse(self, chat_id: int, chat_title: str, user_id: int, spoken_text: str) -> None:
         if not spoken_text:
             return
-        if await self.moderation.is_user_admin_or_creator(chat_id, user_id):
+        if await self._is_admin_fast(chat_id, user_id):
             return
-        settings = await self.db.get_group_settings(chat_id)
+        settings = await self._get_cached_settings(chat_id)
         if not settings.get("mute_on_abuse", 1):
             return
         words = await self.db.get_bad_words(chat_id)
@@ -216,9 +249,9 @@ class AssistantVCController:
         if not pcm_bytes or (self.assistant_id and int(user_id) == self.assistant_id):
             return
         title = self._chat_titles.get(chat_id, str(chat_id))
-        if await self.moderation.is_user_admin_or_creator(chat_id, user_id):
+        if await self._is_admin_fast(chat_id, user_id):
             return
-        settings = await self.db.get_group_settings(chat_id)
+        settings = await self._get_cached_settings(chat_id)
         if not settings.get("mute_on_abuse", 1):
             return
         words = await self.db.get_bad_words(chat_id)
@@ -340,13 +373,12 @@ class AssistantVCController:
     async def _poll_active_calls_loop(self) -> None:
         while self._running:
             try:
-                await asyncio.sleep(3)
+                await asyncio.sleep(2)
                 if not self.client or not self.client.is_connected() or not self.calls:
                     continue
-                await self._sync_dialogs_and_calls(auto_join=True)
-
                 active_items = list(self._active_joins.items())
                 if not active_items:
+                    await self._sync_dialogs_and_calls(auto_join=True)
                     continue
 
                 async def _check_one(cid_chat: int, cid_call: int) -> None:
@@ -354,7 +386,6 @@ class AssistantVCController:
                         ahash = self._call_access_hashes.get(cid_call, 0)
                         title = self._chat_titles.get(cid_chat, str(cid_chat))
                         await self._inspect_call_participants(cid_chat, title, cid_call, ahash)
-                        await asyncio.sleep(0.15)
 
                 await asyncio.gather(*(_check_one(c_id, call_id) for c_id, call_id in active_items))
             except asyncio.CancelledError:
@@ -408,7 +439,7 @@ class AssistantVCController:
                     if auto_join and chat_id not in self._active_joins:
                         logger.info("VC_DEBUG: Found active VC '%s' (chat_id=%s, call_id=%s)", title, chat_id, cid)
                         await self.join_vc(chat_id, title, cid, ahash)
-                        await asyncio.sleep(0.5)
+                        await asyncio.sleep(0.3)
                 elif chat_id in self._active_joins:
                     await self.leave_vc(chat_id, title, reason="VC_ENDED_BY_ADMIN", force=True)
         except Exception as exc:
@@ -443,12 +474,11 @@ class AssistantVCController:
         if getattr(p, "left", False):
             return
 
-        if await self.moderation.is_user_admin_or_creator(chat_id, user_id):
+        if await self._is_admin_fast(chat_id, user_id):
             return
 
-        settings = await self.db.get_group_settings(chat_id)
+        settings = await self._get_cached_settings(chat_id)
 
-        # 1. Non-group member in VC -> mute
         if settings.get("mute_non_members", 1):
             if not await self._is_group_member(chat_id, user_id):
                 await self.mute_or_enforce_in_vc(
@@ -473,30 +503,28 @@ class AssistantVCController:
         screen_paused = bool(getattr(p, "presentation_paused", False) or getattr(p, "screen_paused", False))
         screen_stopped = bool(getattr(p, "presentation_stopped", False) or getattr(p, "screen_stopped", False))
 
-        # 2. Screen sharing -> mute
+        # Screen sharing -> immediate group remove
         if settings.get("mute_on_screen_share", 1) and _is_media_stream_active(
             screen_attr, flag_attr=screen_attr, paused_flag=screen_paused, stopped_flag=screen_stopped
         ):
-            logger.info("VC_DEBUG: Screen share active for user=%s in '%s'", user_id, chat_title)
-            await self.mute_or_enforce_in_vc(
+            await self.fast_remove_from_group(
                 chat_id=chat_id,
                 chat_title=chat_title,
                 user_id=user_id,
-                reason="Started screen sharing in VC",
+                reason="Started screen sharing in VC -> removed from group",
             )
             return
 
-        # 3. Camera ON -> mute
+        # Camera ON -> immediate group remove
         camera_active = _is_media_stream_active(
             video_attr, flag_attr=is_video_on_attr or camera_attr, paused_flag=video_paused, stopped_flag=video_stopped
         )
         if settings.get("mute_on_camera", 1) and camera_active:
-            logger.info("VC_DEBUG: Camera active for user=%s in '%s'", user_id, chat_title)
-            await self.mute_or_enforce_in_vc(
+            await self.fast_remove_from_group(
                 chat_id=chat_id,
                 chat_title=chat_title,
                 user_id=user_id,
-                reason="Camera turned ON in VC",
+                reason="Camera turned ON in VC -> removed from group",
             )
 
     async def _resolve_chat_from_update(self, update: Any) -> Tuple[Optional[int], str]:
@@ -560,7 +588,7 @@ class AssistantVCController:
             logger.warning("VC_DEBUG: Assistant/PyTgCalls not ready; cannot join VC in %s", chat_id)
             return False
 
-        settings = await self.db.get_group_settings(chat_id)
+        settings = await self._get_cached_settings(chat_id)
         if not settings.get("auto_vc_join", 1):
             logger.info("VC_DEBUG: auto_vc_join disabled in '%s' (chat_id=%s).", chat_title, chat_id)
             return False
@@ -671,4 +699,3 @@ class AssistantVCController:
             await self.leave_vc(chat_id, title, reason="BOT_SHUTDOWN", force=True)
         if self.client and self.client.is_connected():
             await self.client.disconnect()
-     
