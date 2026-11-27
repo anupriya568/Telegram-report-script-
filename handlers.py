@@ -1,3 +1,4 @@
+import asyncio
 import html
 import os
 import time
@@ -72,8 +73,23 @@ def register_handlers(
     start_mono: float,
     notify_owner_cb,
 ) -> None:
+    active_tag_tasks: dict[int, asyncio.Task] = {}
+
     def is_owner(user_id: Optional[int]) -> bool:
         return user_id is not None and int(user_id) == int(owner_id)
+
+    async def is_group_owner_or_admin(chat_id: int, user_id: Optional[int]) -> bool:
+        if not user_id:
+            return False
+        if is_owner(user_id):
+            return True
+        if await moderation.is_user_admin_or_creator(chat_id, int(user_id)):
+            return True
+        try:
+            member = await app.bot.get_chat_member(chat_id=chat_id, user_id=int(user_id))
+            return getattr(member, "status", None) in ("creator", "administrator")
+        except TelegramError:
+            return False
 
     async def try_assistant_join_group(chat_id: int, chat_title: str) -> bool:
         if not vc_controller.client or not vc_controller.client.is_connected():
@@ -97,7 +113,7 @@ def register_handlers(
         else:
             msg_text = (
                 "ModGuard is now activated in your group.\n"
-                "Note: VC camera protection ke liye assistant account ko bhi group mein add karein aur bot ko Invite Users admin permission dein."
+                "Note: VC moderation ke liye assistant account ko bhi group mein add karein aur bot ko Invite Users admin permission dein."
             )
         try:
             await app.bot.send_message(chat_id=chat_id, text=msg_text)
@@ -305,6 +321,161 @@ def register_handlers(
                 parse_mode="HTML",
             )
 
+    async def cmd_addword(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat = update.effective_chat
+        user = update.effective_user
+        if not chat or chat.type not in ("group", "supergroup") or not update.message:
+            return
+        if not await is_group_owner_or_admin(chat.id, user.id if user else None):
+            await update.message.reply_text("❌ Sirf group owner ya admin word add kar sakte hain.")
+            return
+        raw_word = " ".join(context.args or []).strip()
+        if not raw_word:
+            await update.message.reply_text("Usage: <code>/addword &lt;word&gt;</code>", parse_mode="HTML")
+            return
+        await db.upsert_group(chat.id, chat.title or str(chat.id), await moderation.is_bot_admin(chat.id))
+        added = await db.add_bad_word(chat.id, raw_word, added_by=user.id if user else None)
+        if added:
+            await update.message.reply_text(
+                f"✅ Word added to group filter: <code>{html.escape(raw_word.lower())}</code>",
+                parse_mode="HTML",
+            )
+        else:
+            await update.message.reply_text(
+                f"ℹ️ Word pehle se list mein hai: <code>{html.escape(raw_word.lower())}</code>",
+                parse_mode="HTML",
+            )
+
+    async def cmd_delword(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat = update.effective_chat
+        user = update.effective_user
+        if not chat or chat.type not in ("group", "supergroup") or not update.message:
+            return
+        if not await is_group_owner_or_admin(chat.id, user.id if user else None):
+            await update.message.reply_text("❌ Sirf group owner ya admin word remove kar sakte hain.")
+            return
+        raw_word = " ".join(context.args or []).strip()
+        if not raw_word:
+            await update.message.reply_text("Usage: <code>/delword &lt;word&gt;</code>", parse_mode="HTML")
+            return
+        removed = await db.remove_bad_word(chat.id, raw_word)
+        if removed:
+            await update.message.reply_text(
+                f"🗑️ Word removed: <code>{html.escape(raw_word.lower())}</code>",
+                parse_mode="HTML",
+            )
+        else:
+            await update.message.reply_text("❌ Yeh word is group ki list mein nahi mila.")
+
+    async def cmd_words(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat = update.effective_chat
+        user = update.effective_user
+        if not chat or chat.type not in ("group", "supergroup") or not update.message:
+            return
+        if not await is_group_owner_or_admin(chat.id, user.id if user else None):
+            await update.message.reply_text("❌ Sirf group owner ya admin word list dekh sakte hain.")
+            return
+        words = await db.get_bad_words(chat.id)
+        if not words:
+            await update.message.reply_text("Is group mein koi custom word add nahi hai.")
+            return
+        formatted = ", ".join(f"<code>{html.escape(w)}</code>" for w in words)
+        await update.message.reply_text(
+            f"📝 <b>Group Custom Words ({len(words)}):</b>\n{formatted}",
+            parse_mode="HTML",
+        )
+
+    async def cmd_vcsettings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat = update.effective_chat
+        user = update.effective_user
+        if not chat or chat.type not in ("group", "supergroup") or not update.message:
+            return
+        if not await is_group_owner_or_admin(chat.id, user.id if user else None):
+            await update.message.reply_text("❌ Sirf group owner ya admin VC settings badal sakte hain.")
+            return
+
+        key_map = {
+            "camera": "mute_on_camera",
+            "screen": "mute_on_screen_share",
+            "nonmember": "mute_non_members",
+            "abuse": "mute_on_abuse",
+        }
+        if context.args and len(context.args) >= 2:
+            k_raw = context.args[0].lower()
+            v_raw = context.args[1].lower()
+            if k_raw in key_map and v_raw in ("on", "off"):
+                await db.set_group_setting(chat.id, key_map[k_raw], v_raw == "on")
+
+        s = await db.get_group_settings(chat.id)
+        await update.message.reply_text(
+            f"🛡️ <b>VC Moderation Settings — {html.escape(chat.title or str(chat.id))}</b>\n"
+            f"• Camera Mute (<code>camera</code>): <b>{'ON' if s.get('mute_on_camera', 1) else 'OFF'}</b>\n"
+            f"• Screen Share Mute (<code>screen</code>): <b>{'ON' if s.get('mute_on_screen_share', 1) else 'OFF'}</b>\n"
+            f"• Non-Member VC Mute (<code>nonmember</code>): <b>{'ON' if s.get('mute_non_members', 1) else 'OFF'}</b>\n"
+            f"• Abusive Audio Mute (<code>abuse</code>): <b>{'ON' if s.get('mute_on_abuse', 1) else 'OFF'}</b>\n\n"
+            f"Toggle: <code>/vcsettings camera|screen|nonmember|abuse on|off</code>",
+            parse_mode="HTML",
+        )
+
+    async def _run_tagall_background(chat_id: int, reason_text: str) -> None:
+        try:
+            member_ids: List[int] = []
+            if vc_controller.client and vc_controller.client.is_connected():
+                try:
+                    entity = await vc_controller.client.get_entity(chat_id)
+                    async for m in vc_controller.client.iter_participants(entity, limit=2000):
+                        if getattr(m, "id", None) and not getattr(m, "bot", False):
+                            member_ids.append(int(m.id))
+                except Exception:
+                    pass
+
+            if not member_ids:
+                member_ids = [uid for uid in await vc_controller.collect_group_participants(chat_id) if uid > 0]
+
+            if not member_ids:
+                try:
+                    await app.bot.send_message(chat_id=chat_id, text="ℹ️ Tag karne ke liye members nahi mile.")
+                except TelegramError:
+                    pass
+                return
+
+            batch_size = 5
+            prefix = f"📣 <b>{html.escape(reason_text)}</b>\n" if reason_text else "📣 "
+            for i in range(0, len(member_ids), batch_size):
+                chunk = member_ids[i : i + batch_size]
+                mentions = ", ".join(f'<a href="tg://user?id={uid}">User</a>' for uid in chunk)
+                try:
+                    await app.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"{prefix}{mentions}",
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+                except TelegramError:
+                    pass
+                # Non-blocking yield so other groups, broadcasts, and commands never stall
+                await asyncio.sleep(1.5)
+        finally:
+            active_tag_tasks.pop(chat_id, None)
+
+    async def cmd_tagall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat = update.effective_chat
+        user = update.effective_user
+        if not chat or chat.type not in ("group", "supergroup") or not update.message:
+            return
+        if not await is_group_owner_or_admin(chat.id, user.id if user else None):
+            await update.message.reply_text("❌ Sirf group owner ya admin /tagall use kar sakte hain.")
+            return
+
+        existing = active_tag_tasks.get(chat.id)
+        if existing and not existing.done():
+            await update.message.reply_text("ℹ️ Is group mein tagging pehle se chal rahi hai.")
+            return
+
+        reason_text = _extract_caption_input(update.message, context.args) or ""
+        await update.message.reply_text("🏷️ Tagging background mein start ho gayi hai (baaki kaam bina ruke chalenge).")
+        active_tag_tasks[chat.id] = asyncio.create_task(_run_tagall_background(chat.id, reason_text))
+
     async def on_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
         if not query or not query.data:
@@ -380,10 +551,10 @@ def register_handlers(
         await update.message.reply_text(f"🔧 Maintenance mode: <b>{'ON' if enabled else 'OFF'}</b>", parse_mode="HTML")
 
     async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        await broadcaster.dispatch(update, context, "admin_broadcast")
+        asyncio.create_task(broadcaster.dispatch(update, context, "admin_broadcast"))
 
     async def cmd_updatecast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        await broadcaster.dispatch(update, context, "update_broadcast")
+        asyncio.create_task(broadcaster.dispatch(update, context, "update_broadcast"))
 
     async def cmd_logs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_user or not is_owner(update.effective_user.id):
@@ -433,6 +604,11 @@ def register_handlers(
     app.add_handler(CommandHandler("resetusage", cmd_resetusage))
     app.add_handler(CommandHandler("groups", cmd_groups))
     app.add_handler(CommandHandler("wipegroup", cmd_wipegroup))
+    app.add_handler(CommandHandler("addword", cmd_addword))
+    app.add_handler(CommandHandler("delword", cmd_delword))
+    app.add_handler(CommandHandler("words", cmd_words))
+    app.add_handler(CommandHandler("vcsettings", cmd_vcsettings))
+    app.add_handler(CommandHandler("tagall", cmd_tagall))
     app.add_handler(CallbackQueryHandler(on_start_callback, pattern=r"^mg_(features|how_to_use|back_start)$"))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler("maintenance", cmd_maintenance))
@@ -442,4 +618,3 @@ def register_handlers(
     app.add_handler(CommandHandler("alerts", cmd_alerts))
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_error_handler(on_error)
-  
